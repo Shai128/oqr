@@ -71,3 +71,4 @@ target/
 
 # entire results
 /results/*
+.Rproj.user

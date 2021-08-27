@@ -6,16 +6,17 @@ from argparse import Namespace
 import tqdm
 import six
 from scipy import stats
-import pandas as pd
 import pickle
-
-from helper import  set_seeds
-from torch.utils.data import DataLoader, TensorDataset
+from helper import set_seeds
+from torch.utils.data import DataLoader
 from datasets.datasets import get_scaled_data, get_synthetic_data
-from utils.q_model_ens import QModelEns
+from utils.q_model_ens import QModelEns, MSEModel
 from losses import batch_qr_loss, batch_interval_loss
 import helper
+from helper import SYN_DATA, REAL_DATA
+
 sys.modules['sklearn.externals.six'] = six
+from skgarden import RandomForestQuantileRegressor
 
 np.warnings.filterwarnings('ignore')
 
@@ -30,8 +31,7 @@ else:
 
 
 def get_loss_fn(loss_name):
-
-    if loss_name == 'batch_qr':
+    if loss_name == 'batch_qr' or loss_name == 'batch_wqr':
         fn = batch_qr_loss
     elif loss_name == 'batch_int':
         fn = batch_interval_loss
@@ -96,13 +96,17 @@ def parse_args():
     parser.add_argument('--save_training_results', type=int, default=0,
                         help='1 for saving results during training, or 0 for not saving')
 
-    args = parser.parse_args()
+    parser.add_argument('--method', type=str, default='QR',
+                        help='method to use (QR or qr_forest)')
 
+    args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     device_name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device_name)
     args.device = device
+    if args.method not in ['QR', 'qr_forest']:
+        raise ValueError('method arg not valid')
 
     return args
 
@@ -153,10 +157,9 @@ if __name__ == '__main__':
     args.num_ens = 1
     args.boot = 0
 
-    POSSIBLE_REAL_DATA_NAMES = ['kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21', 'facebook_1', 'facebook_2', 'blog_data', 'bio', 'scaled_bio', 'bike']
+    POSSIBLE_REAL_DATA_NAMES = ['kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21', 'facebook_1', 'facebook_2',
+                                'blog_data', 'bio', 'scaled_bio', 'bike']
 
-    REAL_DATA = 'real data'
-    SYN_DATA = 'synthetic data'
     if 'syn' in args.ds_type.lower():
         data_type = SYN_DATA
     elif 'real' in args.ds_type.lower():
@@ -182,7 +185,6 @@ if __name__ == '__main__':
             SYN_DATA_NAMES = ['3', '10']
         DATA_NAMES = SYN_DATA_NAMES
 
-
     if args.seed is not None:
         SEEDS = [args.seed]
     elif args.seed_begin is not None and args.seed_end is not None:
@@ -196,8 +198,7 @@ if __name__ == '__main__':
 
     alpha = 0.1
 
-    args_summary = str("loss=" + args.loss + "_bs=" + str(args.bs) + "_corr_mult=" +
-                       str(args.corr_mult) +'_hsic_mult='+str(args.hsic_mult))
+    args_summary = helper.args_to_txt(args)
 
     if 'int' in args.loss:
         TRAINING_OVER_ALL_QUANTILES = True
@@ -217,13 +218,17 @@ if __name__ == '__main__':
             args.data = str(d)
             args.seed = s
 
-
             set_seeds(args.seed)
+            data_args = Namespace(dataset=args.data, seed=args.seed)
 
             if data_type == REAL_DATA:
                 # Fetching data
-                data_args = Namespace(dataset=args.data, seed=args.seed)
                 data_out = get_scaled_data(args)
+                x_train, y_train = data_out.x_train, data_out.y_train
+                unscaled_x_train = None
+                unscaled_x_test = None
+                minority_group_uncertainty = None
+                group_feature = None
 
             else:
                 minority_group_uncertainty = d
@@ -235,41 +240,51 @@ if __name__ == '__main__':
                 unscaled_x_va = data_out.unscaled_x_va
                 n_groups = data_out.n_groups
                 group_feature = data_out.group_feature
-                syn_x_train = data_out.syn_x_train  # train + validation x
-                syn_y_train = data_out.syn_y_train  # train + validation y
+                x_train = data_out.syn_x_train  # train + validation x
+                y_train = data_out.syn_y_train  # train + validation y
 
             x_tr, x_va, x_te, y_tr, y_va, y_te, y_al = \
                 data_out.x_tr, data_out.x_va, data_out.x_te, data_out.y_tr, \
                 data_out.y_va, data_out.y_te, data_out.y_al
-            y_range = (y_al.max() - y_al.min()).item()
+            x_va, y_va = x_va.to(args.device), y_va.to(args.device)
+            x_tr, y_tr = x_tr.to(args.device), y_tr.to(args.device)
+            y_te, x_te = y_te.to(args.device), x_te.to(args.device)
+            x_train, y_train = x_train.to(args.device), y_train.to(args.device)
+            x_test = x_te
+            y_test = y_te
 
-            # Fetching data
-            data_args = Namespace(dataset=args.data, seed=args.seed)
+            if args.method == 'qr_forest':
+                helper.run_tree_experiment(x_train, y_train, x_test, y_test, unscaled_x_train, unscaled_x_test, data_type,
+                                           minority_group_uncertainty, group_feature, args, s, d)
+                continue
+
+            w_tr, w_va, get_tr_weights = helper.get_wqr_weights(args.loss, x_tr, y_tr, x_va, y_va, args)
+
+
+            y_range = (y_al.max() - y_al.min()).item()
 
             # creating the model
             num_tr = x_tr.shape[0]
             dim_x = x_tr.shape[1]
             dim_y = y_tr.shape[1]
 
-            model_ens = QModelEns(input_size=dim_x+1, output_size=dim_y,
+            model_ens = QModelEns(input_size=dim_x + 1, output_size=dim_y,
                                   hidden_size=args.hs, num_layers=args.nl, dropout=args.dropout,
                                   lr=args.lr, wd=args.wd,
                                   num_ens=args.num_ens, device=args.device)
 
-            # Data loader
-            loader = DataLoader(TensorDataset(x_tr, y_tr),
+            loader = DataLoader(helper.IndexedDataset(x_tr, y_tr),
                                 shuffle=True,
                                 batch_size=args.bs)
 
             # Loss function
             loss_fn = get_loss_fn(args.loss)
             batch_loss = True if 'batch' in args.loss else False
-
             """ train loop """
             tr_loss_list = []
             va_loss_list = []
             te_loss_list = []
-
+            batch_size = args.bs
             for ep in range(args.num_ep):
 
                 if model_ens.done_training:
@@ -278,77 +293,63 @@ if __name__ == '__main__':
 
                 # Take train step
                 ep_train_loss = []  # list of losses from each batch, for one epoch
-                for (xi, yi) in loader:
-                    xi, yi = xi.to(args.device), yi.to(args.device)
+                epoch_loss = []
+
+                for xi, yi, index in loader:
                     if TRAINING_OVER_ALL_QUANTILES:
                         q_list = torch.rand(args.num_q)
                     else:
                         q_list = torch.Tensor([alpha / 2])
                     loss = model_ens.loss(loss_fn, xi, yi, q_list,
                                           batch_q=batch_loss,
-                                          take_step=True, args=args)
+                                          take_step=True, args=args, weights=get_tr_weights(index))
                     ep_train_loss.append(loss)
 
                 ep_tr_loss = np.nanmean(np.stack(ep_train_loss, axis=0), axis=0)
                 tr_loss_list.append(ep_tr_loss)
 
                 # Validation loss
-                x_va, y_va = x_va.to(args.device), y_va.to(args.device)
+                # x_va, y_va = x_va.to(args.device), y_va.to(args.device)
                 if TRAINING_OVER_ALL_QUANTILES:
                     va_te_q_list = torch.linspace(0.01, 0.99, 99)
                 else:
-                    va_te_q_list = torch.Tensor([alpha/2, 1-alpha/2])
+                    va_te_q_list = torch.Tensor([alpha / 2, 1 - alpha / 2])
                 ep_va_loss = model_ens.update_va_loss(
                     loss_fn, x_va, y_va, va_te_q_list,
                     batch_q=batch_loss, curr_ep=ep, num_wait=args.wait,
-                    args=args
+                    args=args, weights=w_va
                 )
                 va_loss_list.append(ep_va_loss)
 
                 if save_results_during_training:
                     if data_type == SYN_DATA:
-                        for (unscaled_x, x,y,set_name) in [(unscaled_x_tr, x_tr, y_tr, 'train'),
-                                                           (unscaled_x_va, x_va, y_va, 'validation'), (unscaled_x_test,x_te, y_te, 'test')]:
+                        for (unscaled_x, x, y, set_name) in [(unscaled_x_tr, x_tr, y_tr, 'train'),
+                                                             (unscaled_x_va, x_va, y_va, 'validation'),
+                                                             (unscaled_x_test, x_te, y_te, 'test')]:
                             update_results_during_training(model_ens, x, y, set_name,
                                                            results_during_training[s], alpha)
                             for group_number in range(n_groups):
                                 group_idx = (unscaled_x[:, group_feature] == group_number)
                                 update_results_during_training(model_ens, x[group_idx], y[group_idx],
-                                                               set_name+'_group_'+str(group_number),
+                                                               set_name + '_group_' + str(group_number),
                                                                results_during_training[s], alpha)
 
                     else:
-                        for (x,y,set_name) in [(x_tr, y_tr, 'train'), (x_va, y_va, 'validation'), (x_te, y_te, 'test')]:
+                        for (x, y, set_name) in [(x_tr, y_tr, 'train'), (x_va, y_va, 'validation'),
+                                                 (x_te, y_te, 'test')]:
                             update_results_during_training(model_ens, x, y, set_name,
                                                            results_during_training[s], alpha)
 
-
-
                 # Printing some losses
-                if (ep % 100 == 0) or (ep == args.num_ep-1):
-                    # pass
-                    print('EP:{}'.format(ep))
-                    # print('Train loss {}'.format(ep_tr_loss))
-                    # print('Val loss {}'.format(ep_va_loss))
-                    # print('Test loss {}'.format(ep_te_loss))
-
+                if (ep % 100 == 0) or (ep == args.num_ep - 1):
+                    # print('EP:{}'.format(ep))
+                    pass
             # Move everything to cpu
             x_tr, y_tr, x_va, y_va, x_te, y_te = \
                 x_tr.cpu(), y_tr.cpu(), x_va.cpu(), y_va.cpu(), x_te.cpu(), y_te.cpu()
             model_ens.use_device(torch.device('cpu'))
 
-
-            if data_type == REAL_DATA:
-                x_train = torch.cat((x_tr, x_va))
-                y_train = torch.cat((y_tr, y_va))
-            else:
-                x_train = syn_x_train  # train + validation x
-                y_train = syn_y_train  # train + validation y
-
-            x_test = x_te
-            y_test = y_te
-
-            quantiles = torch.Tensor([alpha/2, 1-alpha/2])
+            quantiles = torch.Tensor([alpha / 2, 1 - alpha / 2])
             test_preds = model_ens.predict_q(
                 x_te, quantiles, ens_pred_type='conf',
                 recal_model=None, recal_type=None
@@ -368,44 +369,15 @@ if __name__ == '__main__':
             y_lower = test_preds[:, 0]
             y_test = y_test.reshape(len(y_test))
 
-
-            if data_type==SYN_DATA:
-                synthetic_data_params={
-                    'consider_groups': True,
-                    'group_feature':group_feature
-                }
-
-                x_train = unscaled_x_train
-                x_test = unscaled_x_test
-            else:
-                synthetic_data_params = {
-                    'consider_groups': False
-                }
-
-
-
-            return_values = helper.calculate_results(x_train,
-                                                               y_train,
-                                                               x_test,
-                                                               y_test,
-                                                               y_upper,
-                                                               y_lower,
-                                                               train_y_upper,
-                                                               train_y_lower,
-                                                               **synthetic_data_params)
-
-            if data_type == SYN_DATA:
-                curr_results_path = results_path + 'syn_data/minority_group_uncertainty=' + str(minority_group_uncertainty) + '/'
-            else:
-                dataset_number = ''
-                curr_results_path = results_path + 'real_data/' + d + '/'
-
-            curr_results_path += args_summary
-
-            helper.create_folder_if_it_doesnt_exist(curr_results_path)
-            file_name = curr_results_path + '/seed=' + str(s)
-
-            pd.DataFrame(return_values, index=[s]).to_csv(file_name + '.csv')
+            helper.save_results(d, data_type, x_train, unscaled_x_train, x_test, unscaled_x_test, y_train, y_test,
+                                y_upper,
+                                y_lower,
+                                train_y_upper,
+                                train_y_lower,
+                                s,
+                                args,
+                                minority_group_uncertainty=minority_group_uncertainty,
+                                group_feature=group_feature)
 
             if save_results_during_training:
                 data_name = d
@@ -422,6 +394,6 @@ if __name__ == '__main__':
                     total_results_during_training[args_summary] = {}
                 total_results_during_training[args_summary] = results_during_training
 
-                pickle.dump(total_results_during_training, open(during_training_results_saving_dir+'results_during_training', "wb"))
+                pickle.dump(total_results_during_training,
+                            open(during_training_results_saving_dir + 'results_during_training', "wb"))
             print()
-

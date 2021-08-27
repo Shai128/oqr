@@ -39,5 +39,6 @@ dependencies:
   - six
   - multiprocess
   - pip
+  - openpyxl
 
     

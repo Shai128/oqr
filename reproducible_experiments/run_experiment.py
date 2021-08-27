@@ -19,7 +19,7 @@ def run_experiment(experiment_params):
         assert 'real' in data_type.lower()
         command += ' --test_ratio 0.4 --nl 3 --dropout 0.1 '
 
-    for param in ['hsic_mult', 'corr_mult', 'data', 'loss']:
+    for param in ['hsic_mult', 'corr_mult', 'data', 'loss', 'method']:
         if param in experiment_params:
             command += f' --{param} {experiment_params[param]} '
 

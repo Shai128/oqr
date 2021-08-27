@@ -254,10 +254,10 @@ def scale_data_wrapper(x,y, args):
 
 
 def scale_data(x,y, seed, test_size=0.1):
-    x_tr, x_te, y_tr, y_te = train_test_split(
+    x_train, x_te, y_train, y_te = train_test_split(
         x, y, test_size=test_size, random_state=seed)
     x_tr, x_va, y_tr, y_va = train_test_split(
-        x_tr, y_tr, test_size=0.1, random_state=seed)
+        x_train, y_train, test_size=0.1, random_state=seed)
 
     s_tr_x = StandardScaler().fit(x_tr)
     s_tr_y = StandardScaler().fit(y_tr)
@@ -271,8 +271,11 @@ def scale_data(x,y, seed, test_size=0.1):
     y_te = torch.Tensor(s_tr_y.transform(y_te))
     y_al = torch.Tensor(s_tr_y.transform(y))
 
+    x_train = torch.cat([x_tr, x_va], dim=0)
+    y_train = torch.cat([y_tr, y_va], dim=0)
     out_namespace = Namespace(x_tr=x_tr, x_va=x_va, x_te=x_te,
-                              y_tr=y_tr, y_va=y_va, y_te=y_te, y_al=y_al)
+                              y_tr=y_tr, y_va=y_va, y_te=y_te, y_al=y_al,
+                              x_train=x_train, y_train=y_train)
 
     return out_namespace
 

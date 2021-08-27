@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import six
 import sys
 import torch
@@ -17,9 +19,10 @@ import sklearn.tree
 import traceback
 import math
 
+from cond_coverage_metrics import calculate_node_coverage
 from helper import create_folder_if_it_doesnt_exist, get_x_test
-from utils.penalty_multipliers import real_corr_per_dataset_per_loss, syn_corr_per_dataset_per_loss
-
+from utils.penalty_multipliers import real_corr_per_dataset_per_loss, syn_corr_per_dataset_per_loss, \
+    real_hsic_per_dataset_per_loss, syn_hsic_per_dataset_per_loss
 
 if torch.cuda.is_available():
     device = "cuda:0"
@@ -28,6 +31,22 @@ else:
 
 np.warnings.filterwarnings('ignore')
 sys.modules['sklearn.externals.six'] = six
+
+VANILLA_QR = 'Vanilla QR'
+OQR_CORR = 'OQR (corr)'
+OQR_HSIC = 'OQR (HSIC)'
+
+metrics_rename_map = {
+    'coverage': 'Coverage',
+    'interval_len': 'Length',
+    'length': 'Length',
+    'test_hsic': 'HSIC',
+    'test_wsc_diff': 'ΔWSC',
+    'test_pearson_corr': "Pearson's corr",
+    'Delta_ILS_coverage_ratio': 'ΔILS-Coverage',
+    'Delta_node_coverage_ratio': 'ΔNode-Coverage',
+    'Delta_ILS_coverage': 'ΔILS-Coverage',
+    'Delta_node_coverage': 'ΔNode-Coverage'}
 
 
 class SquareRootScale(mscale.ScaleBase):
@@ -77,6 +96,7 @@ class SquareRootScale(mscale.ScaleBase):
 
     def get_transform(self):
         return self.SquareRootTransform()
+
 
 mscale.register_scale(SquareRootScale)
 
@@ -155,7 +175,6 @@ def plot_results_during_training(results_during_training, desired_coverage=0.9):
             plt.axhline(y=desired_coverage, color='r', linestyle='-')
             plt.axvline(len(results_during_training[results_name]) - 200, color='purple', linestyle='-')
 
-
         elif 'interval_lengths' in results_name:
             y_label = 'avg interval length'
             plt.axvline(len(results_during_training[results_name]) - 200, color='purple', linestyle='-')
@@ -169,43 +188,11 @@ def plot_quantile_estimator_results_during_training(quantile_estimator, desired_
     plot_results_during_training(learner.results_during_training, desired_coverage=desired_coverage)
 
 
-def replace_None_by_0(a):
-    if a is None:
-        return 0
-    if type(a) == str:
-        a = ast.literal_eval(a.replace("tensor", "").replace("(", "").replace(")", ""))
-    if type(a) == list and type(a[0]) == str:
-        for i in range(len(a)):
-            a[i] = ast.literal_eval(a[i].replace("tensor", "").replace("(", "").replace(")", ""))
-    return a
-
-
-features = ['coverage', 'interval_len']
-
-
-def get_feature_df_to_boxplot(results, x_name='DS', features=features):
-    df = pd.DataFrame(results)
-    feature_df = {}
-    for feature in features:
-
-        feature_df[feature] = {}
-        for i in range(len(df)):
-            curr_row = df[feature].iloc[i]
-            if type(df.index[i]) == float:
-                row_name = df.index[i].round(3)
-            else:
-                row_name = df.index[i]
-            if type(curr_row) == str:
-                curr_row = ast.literal_eval(curr_row.replace("tensor", "").replace("(", "").replace(")", ""))
-            if type(curr_row) == list and type(curr_row[0]) == str:
-                for i in range(len(curr_row)):
-                    if type(curr_row[i]) != str:
-                        continue
-                    curr_row[i] = ast.literal_eval(curr_row[i].replace("tensor", "").replace("(", "").replace(")", ""))
-
-            feature_df[feature][x_name + str(row_name)] = {
-                'Experiment ' + str(v): (float)(replace_None_by_0(curr_row[v])) for v, k in enumerate(curr_row)}
-    return feature_df
+def get_feature_df_to_boxplot(results, x_name='DS', features=['coverage', 'interval_len']):
+    feature_df = deepcopy(results)[features]
+    feature_df.index = [x_name + str(row_name) for row_name in feature_df.index]
+    feature_df = feature_df.applymap(lambda col: {f'Experiment {i}': col[i] for i in range(len(col))})
+    return feature_df.to_dict()
 
 
 def limit_y_plot(feature, significance=None):
@@ -221,13 +208,10 @@ def limit_y_plot(feature, significance=None):
         plt.ylim(-0.1, 0.1)
 
 
-
-def plot_features(df, x_name='DS', x_label='DS#', limit_y=True, features=features, significance=None):
+def plot_features(df, x_name='DS', x_label='DS#', limit_y=True, features=[], significance=None):
     df = get_feature_df_to_boxplot(df, x_name=x_name, features=features)
     for feature in features:
-
         pd.DataFrame(df[feature]).boxplot(figsize=(13.5, 3.5), return_type='axes')
-
         if limit_y:
             limit_y_plot(feature, significance)
         plt.ylabel(feature)
@@ -255,7 +239,7 @@ def add_coverage_and_lengths_to_df(df):
     return df
 
 
-def summarize_df(col_series):
+def summarize_col(col_series):
     corr = np.abs(col_series['test_pearson_corr'])
     col_summary = {
         'Coverage': np.mean(col_series['coverage']),
@@ -263,64 +247,36 @@ def summarize_df(col_series):
         "Pearson's correlation average": np.mean(corr),
         "log(HSIC) average": np.mean(np.log10(col_series['test_hsic'])),
         'WSC average': np.mean(col_series['test_wsc']),
-        'Delta WSC average': np.mean(col_series['test_wsc_diff']),
+        'ΔWSC average': np.mean(col_series['test_wsc_diff']),
     }
     return col_summary
 
 
+def syn_summarize_col(col):
+    summarized = pd.Series(summarize_col(col)).to_frame(col.name)
+    n_groups = max(
+        int(feature.replace("test_group_", "")[0]) for feature in col.index if feature.startswith('test_group_'))
 
-def calculate_node_coverage(seed, dataset_name, with_corr_coverages, no_corr_coverages,
-                            length_diff, ninth_quantile, calibrated=False):
-    x = get_x_test(dataset_name, seed)
-    if calibrated:
-        idx = np.arange(len(x))  # np.random.permutation(len(y_upper))
-        n_half = int(np.floor(len(x) / 2))
-        idx_test, idx_cal = idx[:n_half], idx[n_half:2 * n_half]
-        x = x[idx_test]
+    groups_summary = {}
+    for i in range(n_groups):
+        groups_summary.update({
+            f'Group {i} coverage average': np.mean(col[f'test_group_{i}_coverage']),
+            f'Group {i} interval length average': np.mean(col[f'test_group_{i}_interval_len']),
 
-    x = pd.DataFrame(x.numpy())
-
-    large_diff_idx = length_diff[seed, :] > ninth_quantile[seed]
-    large_diff_df = x[large_diff_idx]
-    large_diff_df['had_diff'] = 1
-
-    small_diff_df = x[~large_diff_idx]
-    small_diff_df['had_diff'] = 0
-    tree_df = pd.concat([large_diff_df, small_diff_df], axis=0)
-    labels = tree_df['had_diff']
-    tree_df = tree_df.drop(['had_diff'], axis=1)
-
-    max_depth = 3
-    tree = sklearn.tree.DecisionTreeClassifier(criterion='entropy', max_depth=max_depth)
-
-    tree.fit(tree_df, labels)
-
-    # finding the node with the best ratio (# increased length) / (#  non increased length)
-    best_samples_ratio = 0
-    best_node = None
-    decision_path = tree.decision_path(x).toarray()
-    n_nodes = decision_path.shape[1]
-
-    for node in range(1, n_nodes):
-        if decision_path[:, node].sum() < 0.05 * tree_df.shape[0]:
-            continue
-
-        n_increased_length_in_node = labels[decision_path[:, node] == 1].sum()
-        n_not_increased_length_in_node = (decision_path[:, node] == 1).sum() - n_increased_length_in_node
-        samples_ratio = n_increased_length_in_node / n_not_increased_length_in_node
-
-        if best_node is None or samples_ratio > best_samples_ratio:
-            best_node = node
-            best_samples_ratio = samples_ratio
-    if best_node is None:
-        best_node = 0
+        })
+    res = summarized.append(pd.Series(groups_summary).to_frame(col.name)).to_dict()[col.name]
+    return res
 
 
-    with_corr_coverage_in_node = with_corr_coverages[seed][decision_path[:, best_node] == 1].mean()
-    no_corr_coverage_in_node =no_corr_coverages[seed][decision_path[:, best_node] == 1].mean()
-    return with_corr_coverage_in_node, no_corr_coverage_in_node
+def summarize_df(df, is_real):
+    summarize_col_method = summarize_col if is_real else syn_summarize_col
+    summary_df = pd.DataFrame(list((df.apply(summarize_col_method, axis=0)).values))
+    summary_df.index = df.columns
+    summary_df = summary_df.T.applymap(float_to_str)
+    return summary_df
 
-def display_cov_vs_len_graphs(col,corr_1_cov_and_len, no_corr_cov_and_len,
+
+def display_cov_vs_len_graphs(col, corr_1_cov_and_len, no_corr_cov_and_len,
                               desired_coverage, loss_method, dataset_name, examples_per_bin):
     fig1 = plt.figure()
     # fig2 = plt.figure()
@@ -363,473 +319,172 @@ def display_cov_vs_len_graphs(col,corr_1_cov_and_len, no_corr_cov_and_len,
     plt.show()
 
 
-
-def display_results_over_datasets(dataset_names, loss_method='qr',
-                                  corr_mults=None, hsic_mults=None, seeds=range(0, 30),
-                                  desired_coverage=0.9, calibrated=False, is_synthetic=False, print_latex=False):
-
-    if is_synthetic:
-        display_results_func = display_syn_results_over_dataset
-    else:
-        display_results_func = display_results_over_dataset
-
-    assert loss_method == 'qr' or loss_method == 'int'
-    std_errors = {}
-    for dataset_name in dataset_names:
-
-        res = display_results_func(dataset_name, loss_method, True, corr_mults, hsic_mults, seeds,
-                                     desired_coverage, calibrated)
-        if len(res) == 3:
-            std_errors[dataset_name], baseline_method, improved_method = res
-    if len(std_errors) == 0:
-        return
-    metrics = ['test_pearson_corr', 'test_hsic', 'test_wsc_diff']
-    if not is_synthetic:
-        metrics += ['Delta_ILS_coverage', 'Delta_node_coverage']
-
-    std_errors_df = {}
-
-    metrics = ['coverage', 'length'] + metrics
-
-    def print_method_res(dataset_name, metric, method_number):
-        mean1 = std_errors[dataset_name]['mean'][metric][method_number]
-        mean2 = std_errors[dataset_name]['mean'][metric][1-method_number]
-        if mean1 < mean2 and print_latex:
-            return "\\textbf{"+float_to_str(mean1)+ f" ({float_to_str(std_errors[dataset_name][metric][method_number])})"+"}"
-        else:
-            return float_to_str(mean1) + f" ({float_to_str(std_errors[dataset_name][metric][method_number])})"
-
-    for metric in metrics:
-
-        std_errors_df[metric] = {'QR':[print_method_res(dataset_name, metric, 0)
-                                    for dataset_name in dataset_names],
-
-                                  'OQR': [print_method_res(dataset_name, metric, 1)
-                                  for dataset_name in dataset_names]
-                                 }
-
-    map_metric_name = {
-                    'coverage': 'Coverage',
-                    'length': 'Length',
-                    'test_hsic': 'HSIC',
-                     'test_wsc_diff': 'Delta WSC',
-                     'test_pearson_corr': "Pearson's corr",
-                     'Delta_ILS_coverage': 'Delta ILS-Coverage',
-                     'Delta_node_coverage': 'Delta Node-Coverage'}
-    if print_latex:
-        metrics.remove('coverage')
-        metrics.remove('length')
-    if print_latex:
-        bolded_dataset_names = ["\\textbf{"+dataset_name+"}" for dataset_name in dataset_names]
-    else:
-        bolded_dataset_names = dataset_names
-    std_errors_df = pd.concat(
-        dict(zip([map_metric_name[metric] for metric in metrics],
-                 [pd.DataFrame(std_errors_df[metric], index=bolded_dataset_names) for metric in metrics])),axis=1)
-    if print_latex:
-        print(std_errors_df.to_latex(index=True).replace("\\textbackslash ", "\\").replace("\{", "{").replace("\}", "}"))
-
-    print("Mean values and standard errors:")
-    display(std_errors_df)
-
-
 def float_to_str(n):
+    if type(n) == str:
+        return n
+
     if abs(n) < 1e-3 and abs(n) > 1e-20 and not math.isnan(n):
         if n > 0:
             sign = ''
         else:
             sign = '-'
-        return sign + '1e' + str(int(np.log10(abs(n))))
+        return sign + f'{str(n).replace(".", "").replace("0", "")[0]}e' + str(int(np.log10(abs(n))))
     else:
 
-        n_str = "{:.3f}".format(n)
-        if abs(n) < 1:
-            n_str = n_str.replace("0.", ".")
+        if (type(n) == float and n.is_integer()) or type(n) == int:
+            n_str = str(int(n))
+        else:
+            n_str = str(np.round(n, 3))
+
         return n_str
-def display_results_over_dataset(dataset_name, loss_method='qr', display_tables_only=False,
-                                 corr_mults=None, hsic_mults=None, seeds=range(0, 30),
-                                 desired_coverage=0.9, calibrated=False):
-    features = ['coverage', 'interval_len', 'coverages', 'lengths',
-                'test_hsic', 'test_wsc', 'test_wsc_diff',
-                'test_pearson_corr', 'test_pearson_pvalue'
-                ]
-    df = {}
-    def add_to_def(loss_name, corr_mult, hsic_mult, dataset_name, display_name=''):
-        folder_name = get_folder_name_from_args(loss_name, corr_mult, hsic_mult, calibrated)
-        try:
-            results_path = helper.results_path + 'real_data/' + \
-                           dataset_name + '/' + folder_name + '/'
-
-            n = ''
-
-            if 'meps' in dataset_name:
-                n = dataset_name[-2:]
-
-            if 'facebook' in dataset_name:
-                n = dataset_name[-1:]
-
-            if 'meps' in dataset_name:
-                display_dataset_name = dataset_name[0:3]
-            else:
-                display_dataset_name = dataset_name[0:4]
-
-            row_name = display_name + '_' + display_dataset_name + n
-            df[row_name] = {}
-            for seed in seeds:
-                try:
-                    path = results_path + f'seed={seed}.csv'
-                    res = pd.read_csv(path)
-
-                    need_to_resave = 'test_hsic' not in res
-
-                    cov = float(res['coverage'].item().replace("tensor(", "").replace(")", ""))
-                    res['test_wsc_diff'] = abs(res['test_wsc'] - cov)
-                    res = add_coverage_and_lengths_to_df(res)
-                    res = res[[col for col in res.columns if 'Unnamed' not in col]]
-                    if need_to_resave:
-                        res.to_csv(path)
-
-                except Exception as e:
-                    is_necessary_mult = corr_mult ==\
-                                         real_corr_per_dataset_per_loss[loss_name.replace("batch_","")][dataset_name] or\
-                                        (corr_mult == 0. and hsic_mult==0.) or\
-                                        hsic_mult == real_corr_per_dataset_per_loss['hsic_qr'][dataset_name]
-
-                    if is_necessary_mult:
-                        print(f"Didn't find results in path: {path}.")
-                    # traceback.print_exc()
-                    break
-
-                for feature in features:
-
-                    if feature not in df[row_name]:
-                        df[row_name][feature] = []
-                    df[row_name][feature] += [res.iloc[0][feature]]
-
-            if len(df[row_name]) == 0:
-                del df[row_name]
-
-        except Exception as e:
-            print(e)
-            del df[row_name]
 
 
-    method_name = loss_method
+def get_delta_node_coverage(dataset_name, col_coverages, base_method_coverages,
+                            length_diff, len_diff_ninth_quantiles, calibrated):
+    col_node_coverages = []
+    base_method_node_coverages = []
+    for seed in range(len_diff_ninth_quantiles.shape[0]):
+        col_node_coverage, base_method_node_coverage = \
+            calculate_node_coverage(seed, dataset_name, col_coverages, base_method_coverages,
+                                    length_diff, len_diff_ninth_quantiles, calibrated)
+        col_node_coverages += [col_node_coverage]
+        base_method_node_coverages += [base_method_node_coverage]
 
-    loss_name = f'batch_{method_name}'
+    col_delta_node_coverage = abs(np.array(col_node_coverages) - col_coverages.mean(axis=1))
+    base_method_delta_node_coverage = abs(np.array(base_method_node_coverages) - base_method_coverages.mean(axis=1))
 
-    if corr_mults is None:
-        corr_mults = [0.0, 0.01, 0.1, 0.5, 1., 2., 3.]
-    for corr_mult in corr_mults:
-        add_to_def(loss_name, corr_mult, 0., dataset_name, display_name=method_name + f'+corr{(corr_mult)}', )
+    return col_delta_node_coverage, base_method_delta_node_coverage
 
-    if hsic_mults is None:
-        hsic_mults = [0.0, 0.01, 0.1, 0.5, 1., 2., 3.]
-    for hsic_mult in hsic_mults:
-        add_to_def(loss_name, 0., hsic_mult, dataset_name, display_name=method_name + f'+hsic{(hsic_mult)}')
 
-    df = pd.DataFrame(df)
+def get_delta_ILS_coverage(col_coverages, base_method_coverages,
+                           length_diff, len_diff_ninth_quantiles):
+    col_delta_ILS_coverage = []
+    base_method_delta_ILS_coverage = []
+    for seed in range(col_coverages.shape[0]):
+        col_delta_ILS_coverage.append(
+            abs(col_coverages[seed, :][(length_diff[seed, :].T > len_diff_ninth_quantiles[seed]).T].mean() - \
+                col_coverages[seed, :].mean()))
 
-    cols = pd.DataFrame(df).columns.to_list()
-    cols.sort(key=lambda x: x[-4:])
+        base_method_delta_ILS_coverage.append(
+            abs(base_method_coverages[seed, :][(length_diff[seed, :].T > len_diff_ninth_quantiles[seed]).T].mean() - \
+                base_method_coverages[seed, :].mean()))
+    return np.array(col_delta_ILS_coverage), np.array(base_method_delta_ILS_coverage)
 
-    df = df[cols]
 
-    df_to_plot = pd.DataFrame(df).T.drop(['coverages', 'lengths'], axis=1, errors='ignore')
+def add_delta_ils_and_delta_node_coverage(minority_groups_info, col, col_coverages, col_lengths, dataset_name,
+                                          base_method_coverages, base_method_lengths, calibrated):
+    length_diff = col_lengths - base_method_lengths
+    assert length_diff.shape[1] == col_coverages.shape[1]
+    len_diff_ninth_quantiles = np.sort(length_diff, axis=1)[:, int((col_coverages.shape[1]) * 0.9)]
 
-    if display_tables_only:
-        backend_ = mpl.get_backend()
-        mpl.use("Agg")
-    plot_features(df_to_plot, x_name='', x_label='', limit_y=False, features=df_to_plot.columns)
-    if display_tables_only:
-        mpl.use(backend_)
+    col_delta_node_coverage, base_method_delta_node_coverage = get_delta_node_coverage(dataset_name, col_coverages,
+                                                                                       base_method_coverages,
+                                                                                       length_diff,
+                                                                                       len_diff_ninth_quantiles,
+                                                                                       calibrated)
+    minority_groups_info[col]['Delta_node_coverages_improved'] = col_delta_node_coverage
+    minority_groups_info[col]['Delta_node_coverages_baseline'] = base_method_delta_node_coverage
+    minority_groups_info[col][
+        'Delta_node_coverage_ratio'] = col_delta_node_coverage.mean() / base_method_delta_node_coverage.mean()
 
-    if 'coverages' not in pd.DataFrame(df).T.columns:
-        return
-    no_corr_column = pd.DataFrame(df).columns[0]
-    no_corr_coverages = np.array(pd.DataFrame(df)[no_corr_column].loc['coverages'])
-    no_corr_lengths = np.array(pd.DataFrame(df)[no_corr_column].loc['lengths'])
+    col_delta_ILS_coverage, base_method_delta_ILS_coverage = get_delta_ILS_coverage(col_coverages,
+                                                                                    base_method_coverages,
+                                                                                    length_diff,
+                                                                                    len_diff_ninth_quantiles)
+    # (OQR Delta ILS-Coverage) / (vanilla QR Delta ILS-coverage)
+    minority_groups_info[col]['Delta_ILS_coverage_ratio'] = \
+        col_delta_ILS_coverage.mean() / base_method_delta_ILS_coverage.mean()
+    minority_groups_info[col]['Delta_ILS_coverages_improved'] = np.array(col_delta_ILS_coverage)
+    minority_groups_info[col]['Delta_ILS_coverages_baseline'] = np.array(base_method_delta_ILS_coverage)
 
-    examples_per_bin = int((1 / 100) * no_corr_coverages.shape[0] * no_corr_coverages.shape[1])
-    no_corr_cov_and_len = pd.DataFrame({'coverage': no_corr_coverages.flatten(),
-                                        'interval_sizes': no_corr_lengths.flatten()})
 
-    minorities_info = {}
-    summary_df = {}
-    summary_df[no_corr_column] = summarize_df(df[no_corr_column])
+def get_minority_groups_info_and_summary_df(df, base_method, loss_method, dataset_name, desired_coverage, is_calibrated,
+                                            is_real):
+    base_method_column_name = get_column_name_by_method(base_method, loss=loss_method, dataset_name=dataset_name, is_real=is_real)
+    base_method_column = df[base_method_column_name]
+    base_method_coverages = np.array(base_method_column.loc['coverages'])
+    base_method_lengths = np.array(base_method_column.loc['lengths'])
 
-    for col in pd.DataFrame(df).columns[1:]:
+    examples_per_bin = int((1 / 100) * base_method_coverages.shape[0] * base_method_coverages.shape[1])
+    base_method_cov_and_len = pd.DataFrame({'coverage': base_method_coverages.flatten(),
+                                            'interval_sizes': base_method_lengths.flatten()})
+    minority_groups_info = {}
+    summary_df = {base_method_column_name: summarize_col(base_method_column)}
+    columns = list(df.columns)
+    columns.remove(base_method_column_name)
+    for col in columns:
         print(col)
-        minorities_info[col] = {}
-        with_corr_coverages = np.array(pd.DataFrame(df)[col].loc['coverages']).astype(np.float32)
-        with_corr_lengths = np.array(pd.DataFrame(df)[col].loc['lengths']).astype(np.float32)
-        corr_1_cov_and_len = pd.DataFrame({'coverage': with_corr_coverages.flatten(),
-                                           'interval_sizes': with_corr_lengths.flatten()})
-
-        display_cov_vs_len_graphs(col, corr_1_cov_and_len, no_corr_cov_and_len,
-                              desired_coverage, loss_method, dataset_name, examples_per_bin)
+        summary_df[col] = summarize_col(df[col])
+        col_coverages = np.array(df[col].loc['coverages']).astype(np.float32)
+        col_lengths = np.array(df[col].loc['lengths']).astype(np.float32)
+        col_cov_and_len = pd.DataFrame({'coverage': col_coverages.flatten(),
+                                        'interval_sizes': col_lengths.flatten()})
+        display_cov_vs_len_graphs(col, col_cov_and_len, base_method_cov_and_len,
+                                  desired_coverage, loss_method, dataset_name, examples_per_bin)
 
         try:
-            length_diff = with_corr_lengths - no_corr_lengths
-
-            ninth_quantile = np.sort(length_diff, axis=1)[:, int((with_corr_coverages.shape[1]) * 0.9)]
-
-            with_corr_minority_coverage = []
-            no_corr_minority_coverage = []
-            for seed in range(ninth_quantile.shape[0]):
-                with_corr_minority_coverage += [
-                    with_corr_coverages[seed, :][(length_diff[seed, :].T > ninth_quantile[seed]).T].mean() * 100]
-                no_corr_minority_coverage += [
-                    no_corr_coverages[seed, :][(length_diff[seed, :].T > ninth_quantile[seed]).T].mean() * 100]
-
-            with_corr_coverage_in_node = []
-            no_corr_coverage_in_node = []
-            for seed in range(ninth_quantile.shape[0]):
-                with_corr_node_cov, no_corr_node_cov =\
-                    calculate_node_coverage(seed, dataset_name, with_corr_coverages, no_corr_coverages,
-                                            length_diff, ninth_quantile, calibrated)
-                with_corr_coverage_in_node += [with_corr_node_cov]
-                no_corr_coverage_in_node += [no_corr_node_cov]
-
-            with_corr_delta_node_cov = np.mean(abs(np.array(with_corr_coverage_in_node) - with_corr_coverages.mean(axis=1)))
-            no_corr_delta_node_cov = np.mean(abs(np.array(no_corr_coverage_in_node) - no_corr_coverages.mean(axis=1)))
-
-            minorities_info[col]['Delta_node_coverage_ratio'] = with_corr_delta_node_cov/no_corr_delta_node_cov
-            minorities_info[col]['Delta_node_coverages_improved'] = abs(np.array(with_corr_coverage_in_node) -\
-                                                                        with_corr_coverages.mean(axis=1))
-            minorities_info[col]['Delta_node_coverages_baseline'] = abs(np.array(no_corr_coverage_in_node) -\
-                                                                        no_corr_coverages.mean(axis=1))
-
-            with_corr_delta_ILS_coverage = []
-            no_corr_delta_ILS_coverage = []
-            for seed in range(with_corr_coverages.shape[0]):
-                with_corr_delta_ILS_coverage.append(
-                    abs(with_corr_coverages[seed, :][(length_diff[seed, :].T > ninth_quantile[seed]).T].mean() - \
-                        with_corr_coverages[seed, :].mean()))
-
-                no_corr_delta_ILS_coverage.append(
-                    abs(no_corr_coverages[seed, :][(length_diff[seed, :].T > ninth_quantile[seed]).T].mean() - \
-                        no_corr_coverages[seed, :].mean()))
-
-            # (orthogonal QR Delta ILS-Coverage) / (vanilla QR Delta ILS-coverage)
-            minorities_info[col]['Delta_ILS_coverage_ratio'] = \
-                np.mean(with_corr_delta_ILS_coverage) / \
-                np.mean(no_corr_delta_ILS_coverage)
-
-            minorities_info[col]['Delta_ILS_coverages_improved'] = np.array(with_corr_delta_ILS_coverage)
-            minorities_info[col]['Delta_ILS_coverages_baseline'] = np.array(no_corr_delta_ILS_coverage)
-
-            summary_df[col] = summarize_df(df[col])
+            minority_groups_info[col] = {}
+            add_delta_ils_and_delta_node_coverage(minority_groups_info, col, col_coverages, col_lengths, dataset_name,
+                                                  base_method_coverages, base_method_lengths, is_calibrated)
 
             if len(pd.DataFrame(df).columns) == 2:  # if we compare vanilla vs orthogonal with the best corr mult
-                summary_df[col]["Delta ILS-Coverage"] = np.mean(with_corr_delta_ILS_coverage)
-                summary_df[no_corr_column]["Delta ILS-Coverage"] = np.mean(no_corr_delta_ILS_coverage)
-                summary_df[col]["Delta Node-Coverage"] = with_corr_delta_node_cov
-                summary_df[no_corr_column]["Delta Node-Coverage"] = no_corr_delta_node_cov
-
+                summary_df[col]["Delta ILS-Coverage"] = minority_groups_info[col]['Delta_ILS_coverages_improved'].mean()
+                summary_df[base_method_column_name]["Delta ILS-Coverage"] = minority_groups_info[col][
+                    'Delta_ILS_coverages_baseline'].mean()
+                summary_df[col]["Delta Node-Coverage"] = minority_groups_info[col][
+                    'Delta_node_coverages_improved'].mean()
+                summary_df[base_method_column_name]["Delta Node-Coverage"] = minority_groups_info[col][
+                    'Delta_node_coverages_baseline'].mean()
 
         except Exception:
             traceback.print_exc()
             print(f"There are not enough seed results for {col}.")
             continue
-
-    if len(summary_df) != len(pd.DataFrame(df).columns):
-        print(f"No results for dataset {dataset_name}.")
-        return
-    for col in pd.DataFrame(df).columns:
-
-        for key in summary_df[col]:
-            summary_df[col][key] = float_to_str(summary_df[col][key])
-            # if abs(summary_df[col][key]) < 1e-3 and abs(summary_df[col][key]) > 1e-20 and not math.isnan(
-            #         summary_df[col][key]):
-            #     if summary_df[col][key] > 0:
-            #         sign = ''
-            #     else:
-            #         sign = '-'
-            #     summary_df[col][key] = sign + '1e' + str(int(np.log10(abs(summary_df[col][key]))))
-            # else:
-            #     summary_df[col][key] = "{:.3f}".format(summary_df[col][key])
-
-    if len(pd.DataFrame(summary_df)) > 0:
-        display(pd.DataFrame(summary_df))
-
-    corr_per_dataset_per_loss = real_corr_per_dataset_per_loss
-    try:
-        measurements = ['test_hsic', 'test_wsc_diff', 'test_pearson_corr']
-        measurements_that_should_decrease = measurements
-
-        # if there is an hsic column
-        compute_hsic = len([col for col in pd.DataFrame(df).columns if 'hsic' in col]) > 0
-        baseline_method = 'Vanilla QR'
-
-        improved_method = 'Orthogonal QR (corr)'
-        if compute_hsic:
-
-            hsic_mult = corr_per_dataset_per_loss['hsic_qr'][dataset_name]
-            corr_mult = corr_per_dataset_per_loss['qr'][dataset_name]
-
-            if len([col for col in pd.DataFrame(df).columns if str(corr_mult) in col and 'corr' in col]) == 0:
-                baseline_method_column_name = pd.DataFrame(df).columns[0]
-                improved_method_column_name = \
-                [col for col in pd.DataFrame(df).columns if str(hsic_mult) in col and 'hsic' in col][0]
-                baseline_method = 'Vanilla QR'
-                improved_method = 'Orthogonal QR (HSIC)'
-            else:
-                improved_method_column_name = \
-                [col for col in pd.DataFrame(df).columns if str(corr_mult) in col and 'corr' in col][0]
-                baseline_method_column_name = \
-                [col for col in pd.DataFrame(df).columns if str(hsic_mult) in col and 'hsic' in col][0]
-                baseline_method = 'Orthogonal QR (HSIC)'
-                improved_method = 'Orthogonal QR (corr)'
-
-            baseline_method_column = pd.DataFrame(df)[baseline_method_column_name]
-            improved_method_column = pd.DataFrame(df)[improved_method_column_name]
-
-        else:
-            corr_per_dataset = corr_per_dataset_per_loss[loss_method]
-            corr = corr_per_dataset[dataset_name]
-            baseline_method_column = pd.DataFrame(df)[pd.DataFrame(df).columns[0]]
-
-            improved_method_column_name = [col for col in pd.DataFrame(df).columns if str(corr) in col][0]
-            improved_method_column = pd.DataFrame(df)[improved_method_column_name]
-
-        final_dataset_df = {}
-
-        for measurement in measurements_that_should_decrease:
-            increasement_ratio = np.mean(np.abs(improved_method_column[measurement])) / \
-                                 np.mean(np.abs(baseline_method_column[measurement]))
-            # multiply by negative 1 because smaller metric -> better conditional coverage
-            increasement_percentage = -(increasement_ratio - 1) * 100
-            curr_key_name = measurement
-            final_dataset_df[curr_key_name] = '{:2.2f}'.format(np.round(increasement_percentage, 2))
-            if increasement_percentage > 0:
-                final_dataset_df[curr_key_name] = '+' + final_dataset_df[curr_key_name]
-
-        add_delta_ILS_and_node = 'Vanilla' in baseline_method
-        if add_delta_ILS_and_node:
-            percentage = -(minorities_info[improved_method_column_name]['Delta_node_coverage_ratio'] - 1) * 100
-            curr_key_name = 'Node coverage diff'
-            final_dataset_df[curr_key_name] = '{:2.2f}'.format(np.round(percentage, 2))
-            if percentage > 0:
-                final_dataset_df[curr_key_name] = '+' + final_dataset_df[curr_key_name]
-
-            percentage = -(minorities_info[improved_method_column_name]['Delta_ILS_coverage_ratio'] - 1) * 100
-            curr_key_name = 'Increased length coverage diff'
-            final_dataset_df[curr_key_name] = '{:2.2f}'.format(np.round(percentage, 2))
-            if percentage > 0:
-                final_dataset_df[curr_key_name] = '+' + final_dataset_df[curr_key_name]
-
-        parameters_order = ["Pearson's corr",
-                            'HSIC',
-                            'Delta WSC',
-                            'Delta ILS-Coverage',
-                            'Delta Node-Coverage',
-                            ]
-
-        if not add_delta_ILS_and_node:
-            parameters_order.remove('Delta Node-Coverage')
-            parameters_order.remove('Delta ILS-Coverage')
-
-        if calibrated:
-            baseline_method = baseline_method.replace("QR", "CQR")
-            improved_method = improved_method.replace("QR", "CQR")
-
-        baseline_description = baseline_method
-        improved_description = improved_method
-        std_errors = calc_std_errors(baseline_method, improved_method, baseline_method_column, improved_method_column,
-                                     improved_method_column_name, minorities_info)
-        final_dataset_df = pd.concat({
-            'Coverage': pd.DataFrame(
-                {baseline_description: ['{:2.2f}%'.format(np.mean(baseline_method_column.coverage) * 100)],
-                 improved_description: ['{:2.2f}%'.format(np.mean(improved_method_column.coverage) * 100)]},
-                index=[dataset_name]),
-            'Length': pd.DataFrame({baseline_description: ['{:2.2f}'.format(np.mean(baseline_method_column.interval_len))],
-                                    improved_description: ['{:2.2f}'.format(np.mean(improved_method_column.interval_len))]},
-                                   index=[dataset_name]),
-            '% Improvement': pd.DataFrame(final_dataset_df, index=[dataset_name]).rename(
-                columns={'test_hsic': 'HSIC',
-                         'test_wsc_diff': 'Delta WSC',
-                         'test_pearson_corr': "Pearson's corr",
-                         'Increased length coverage diff': 'Delta ILS-Coverage',
-                         'Node coverage diff': 'Delta Node-Coverage'})[parameters_order]
+    summary_df = pd.DataFrame(summary_df)
+    return minority_groups_info, summary_df
 
 
-        }, axis=1)
-        if calibrated:
-            loss_method = 'cal_'+loss_method
-        save_dir = f"results/final_results/{dataset_name}"
-        create_folder_if_it_doesnt_exist(save_dir)
-        final_dataset_df.to_csv(
-            f'{save_dir}/{loss_method} {baseline_method} vs {improved_method} final_df.csv')
-        return std_errors, baseline_method, improved_method
-    except Exception:
-        traceback.print_exc()
-        print("Don't have the full results to construct the final comparison table.")
-    # display(pd.DataFrame(final_dataset_df, index=[dataset_names[0]]))
-    return {}
+def calc_std_errors(col, relevant_minorities_info=None, improved_or_baseline=None):
+    sqrt_n = np.sqrt(len(col.coverage))
+    col = col.copy()
+    metrics = ['coverage', 'interval_len', 'test_pearson_corr', 'test_hsic', 'test_wsc_diff']
 
-def ratio_stderr(X, Y):
-    X = np.array(X)
-    Y = np.array(Y)
+    if relevant_minorities_info is not None and improved_or_baseline is not None:
+        col['Delta_ILS_coverage'] = relevant_minorities_info[f'Delta_ILS_coverages_{improved_or_baseline}']
+        col['Delta_node_coverage'] = relevant_minorities_info[f'Delta_node_coverages_{improved_or_baseline}']
+        metrics += ['Delta_ILS_coverage', 'Delta_node_coverage']
 
-    var = (((X.mean() / Y.mean()))**2)*(X.var()/(X.mean()**2)+Y.var()/(Y.mean()**2) - 2*np.cov(X,Y)[0][1]/(X.mean()*Y.mean()))
-    return np.sqrt(var) / np.sqrt(len(X))
+    mult_by_100_metrics = ['coverage', 'test_wsc_diff', 'Delta_ILS_coverage', 'Delta_node_coverage']
+    for metric in [metric for metric in mult_by_100_metrics if metric in metrics]:
+        assert np.max(np.abs(col[metric])) <= 1
+        assert np.max(np.abs(col[metric])) <= 1
+        col[metric] = np.array(col[metric]) * 100
 
-def calc_std_errors(baseline_method_name, improved_method_name, baseline_method_col, improved_method_col,
-                    improved_method_column_name=None, minorities_info=None):
-    sqrt_n = np.sqrt(len(baseline_method_col.coverage))
-    assert baseline_method_col.coverage[0] < 1 and improved_method_col.coverage[0] < 1
-
-    metrics = ['test_hsic', 'test_wsc_diff', 'test_pearson_corr']
     std_errors = {}
-    # if not separate_SE:
-    #     std_errors['coverage'] = {baseline_method_name: np.std(baseline_method_col.coverage * 100) / sqrt_n,
-    #                      improved_method_name: np.std(improved_method_col.coverage * 100) / sqrt_n}
-    #
-    #     std_errors['length'] = {baseline_method_name: np.std(baseline_method_col.interval_len) / sqrt_n,
-    #                    improved_method_name: np.std(improved_method_col.interval_len) / sqrt_n}
+    std_errors['mean'] = {}
+    for metric in metrics:
+        std_errors[metric] = np.std(col[metric]) / sqrt_n
+        std_errors['mean'][metric] = np.mean(np.abs(col[metric]))
+    return std_errors
 
-    metrics = ['coverage', 'length'] + metrics
-
-    baseline_method_col = baseline_method_col.copy()
-    improved_method_col = improved_method_col.copy()
-    baseline_method_col['coverage'] = np.array(baseline_method_col.coverage) * 100
-    improved_method_col['coverage'] = np.array(improved_method_col.coverage) * 100
-
-    baseline_method_col['length'] = baseline_method_col.interval_len
-    improved_method_col['length'] = improved_method_col.interval_len
-
+def calc_std_errors_for_two_columns(baseline_method_col, improved_method_col,
+                    improved_method_column_name=None, minorities_info=None):
 
     if improved_method_column_name is not None and minorities_info is not None:
-        col = improved_method_column_name
+        relevant_minorities_info = minorities_info[improved_method_column_name]
+    else:
+        relevant_minorities_info = None
 
-        baseline_method_col['Delta_ILS_coverage'] = minorities_info[col]['Delta_ILS_coverages_baseline']
-        improved_method_col['Delta_ILS_coverage'] = minorities_info[col]['Delta_ILS_coverages_improved']
+    base_method_std_errors = calc_std_errors(baseline_method_col, relevant_minorities_info, 'baseline')
+    improved_method_std_errors = calc_std_errors(improved_method_col, relevant_minorities_info, 'improved')
 
-        baseline_method_col['Delta_node_coverage'] = minorities_info[col]['Delta_node_coverages_baseline']
-        improved_method_col['Delta_node_coverage'] = minorities_info[col]['Delta_node_coverages_improved']
-
-        metrics += ['Delta_ILS_coverage', 'Delta_node_coverage']
+    std_errors = {}
     std_errors['mean'] = {}
-
-    mult_by_100_metrics = ['test_wsc_diff', 'Delta_ILS_coverage', 'Delta_node_coverage']
-    for metric in [metric for metric in mult_by_100_metrics if metric in metrics]:
-        assert np.max(np.abs(baseline_method_col[metric])) <= 1
-        assert np.max(np.abs(improved_method_col[metric])) <= 1
-        baseline_method_col[metric] = np.array(baseline_method_col[metric]) * 100
-        improved_method_col[metric] = np.array(improved_method_col[metric]) * 100
-
-    for metric in metrics:
-        std_errors[metric] = [np.std(baseline_method_col[metric]) / sqrt_n,
-                              np.std(improved_method_col[metric]) / sqrt_n]
-        std_errors['mean'][metric] = [np.mean(np.abs(baseline_method_col[metric])),
-                              np.mean(np.abs(improved_method_col[metric]))]
-        # print(f"baseline {metric} std err: {np.std(baseline_method_col[metric]) / sqrt_n}")
-        # print(f"improved {metric} std err: {np.std(improved_method_col[metric]) / sqrt_n}")
-
-
-
-
+    for metric in [metric for metric in base_method_std_errors.keys() if metric != 'mean']:
+        std_errors[metric] = [base_method_std_errors[metric],
+                              improved_method_std_errors[metric]]
+        std_errors['mean'][metric] = [base_method_std_errors['mean'][metric],
+                                      improved_method_std_errors['mean'][metric]]
     return std_errors
 
 
@@ -843,9 +498,12 @@ def map_sign_to_color(sign):
     return 'color: %s' % color
 
 
-def display_final_results(loss_method, baseline_method, improved_method):
-    dataset_names = ['facebook_1', 'facebook_2', 'blog_data', 'bio',
-                     'kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21']
+def display_final_results(loss_method, baseline_method, improved_method, is_real=True, to_latex=False):
+    if is_real:
+        dataset_names = ['facebook_1', 'facebook_2', 'blog_data', 'bio',
+                         'kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21']
+    else:
+        dataset_names = ['3', '10']
     final_df = pd.DataFrame()
 
     for dataset_name in dataset_names:
@@ -857,8 +515,13 @@ def display_final_results(loss_method, baseline_method, improved_method):
             pass
     try:
         final_df = final_df.rename(columns={'Unnamed: 0_level_0': 'dataset name'}).set_index('dataset name')
-        indexes = [name[0] for name in list(final_df.index)]
+        if is_real:
+            indexes = [name[0] for name in list(final_df.index)]
+        else:
+            indexes = ["$" + name[0].replace("λ", "\\lambda") + "$" for name in list(final_df.index)]
+
         final_df = final_df.set_index(pd.Index(indexes))
+
         styled_final_df = final_df.style.applymap(map_sign_to_color)
         styled_final_df = styled_final_df.set_table_styles([
             {'selector': 'th',
@@ -868,213 +531,308 @@ def display_final_results(loss_method, baseline_method, improved_method):
              ]
              }]
         )
-    except Exception:
+    except Exception as e:
+        raise e
         print("No results to display.")
         return
     display(styled_final_df)
-    styled_final_df.to_excel(f'results/final_results/{loss_method}, {baseline_method}_vs_{improved_method} styled_final_df.xlsx')
-
+    ds_type = 'real' if is_real else 'syn'
+    save_dir = f"results/final_results/{ds_type}"
+    create_folder_if_it_doesnt_exist(save_dir)
+    styled_final_df.to_excel(f'{save_dir}/{loss_method}, {baseline_method}_vs_{improved_method} styled_final_df.xlsx')
+    if to_latex:
+        final_df.index = ["\textbf{" + i + "}" for i in final_df.index]
+        final_df['% Improvement'] = final_df['% Improvement'].applymap(lambda x: "\textcolor[rgb]{ 0,  .502,  0}{" + x + "}" if x[
+                                                                                                  0] == '+' else "\textcolor[rgb]{ 1,  0,  0}{" + x + "}")
+        latex = final_df.to_latex()
+        latex = latex.replace("\\textbackslash ", "\\").replace("\{", "{").replace("\}", "}").replace("\%", "")
+        print(latex)
     return styled_final_df
 
 
-def get_folder_name_from_args(loss, corr_mult, hsic_mult, calibrated=False):
-    corr_mult = float(corr_mult)
-    hsic_mult = float(hsic_mult)
-    folder_name = f'loss={loss}_bs=1024_corr_mult={corr_mult}_hsic_mult={hsic_mult}'
+def get_folder_name_from_args(method_params, calibrated=False):
+    method = method_params['method']
+    assert method in ['QR', 'qr_forest']
+
+    if method == 'qr_forest':
+        folder_name = 'qr_forest'
+    else:
+        loss, corr_mult, hsic_mult = \
+            method_params['loss'], method_params['corr_multiplier'], method_params['hsic_multiplier']
+        corr_mult = float(corr_mult)
+        hsic_mult = float(hsic_mult)
+        loss = loss.replace("batch_", "")
+        folder_name = f'loss=batch_{loss}_bs=1024_corr_mult={corr_mult}_hsic_mult={hsic_mult}'
+
     if calibrated:
-        folder_name = 'cal_'+folder_name
+        folder_name = 'cal_' + folder_name
     return folder_name
 
 
+def initialize_methods_params(method, loss_method, corr_multipliers, hsic_multipliers):
+    if method == 'qr_forest':
+        methods_params = [{
+            'method': 'qr_forest'
+        }]
+    else:
 
-def display_syn_results_over_datasets(dataset_names, loss_method='qr',
-                                      corr_multipliers=None, hsic_multipliers=None):
-    display_results_over_datasets(dataset_names, loss_method,
-                                      corr_multipliers, hsic_multipliers,
-                                  is_synthetic=True)
-    # assert loss_method == 'qr' or loss_method == 'int'
-    # std_errors = {}
-    # for dataset_name in dataset_names:
-    #     std_errors[dataset_name] = display_syn_results_over_dataset(dataset_name, loss_method, True,
-    #                                      corr_multipliers, hsic_multipliers)
-    #
-    # max_coverage_std_error = max([error for error in std_errors['dataset_name']['coverage'].values()])
-    # max_length_std_error = max([error for error in std_errors['dataset_name']['length'].values()])
-    # print(f"max coverage standard error: {max_coverage_std_error}")
-    # print(f"max length standard error: {max_length_std_error}")
+        if corr_multipliers is None:
+            corr_multipliers = [0.0, 0.1, 0.5, 1., 3.]
+        if hsic_multipliers is None:
+            hsic_multipliers = [0.0, 0.1, 0.5]
+
+        methods_params = []
+        for corr in corr_multipliers:
+            for hsic in hsic_multipliers:
+                methods_params += [{
+                    'corr_multiplier': corr,
+                    'hsic_multiplier': hsic,
+                    'loss': loss_method,
+                    'method': 'QR'
+                }]
+
+    return methods_params
 
 
+def display_results(dataset_names, method='QR', loss_method='qr',
+                    corr_multipliers=None, hsic_multipliers=None, seeds=range(0, 30),
+                    desired_coverage=0.9, is_real=False, is_calibrated=False,
+                    base_method=VANILLA_QR, improved_method=OQR_CORR, print_latex=False,keep_cov_and_len=False):
+    assert method in ['QR', 'qr_forest']
+    assert (loss_method == 'qr' or loss_method == 'int' or loss_method == 'wqr') or (method != 'QR')
 
-def display_syn_results_over_dataset(dataset_name, loss_method='qr', display_tables_only=False,
-                                     corr_multipliers=None, hsic_multipliers=None, seeds=range(30),
-                                     desired_coverage=0.9, calibrated=False):
+    methods_params = initialize_methods_params(method, loss_method, corr_multipliers, hsic_multipliers)
 
-    features = ['coverage', 'interval_len', 'coverages', 'lengths',
-                'test_hsic', 'test_wsc', 'test_wsc_diff',
-                'test_pearson_corr', 'test_pearson_pvalue'
-                ]
+    std_errors = {}
+    final_dataset_df = {}
+    for dataset_name in dataset_names:
+        res = display_results_over_dataset(dataset_name, methods_params, True, seeds,
+                                           desired_coverage, is_calibrated, is_real, base_method=base_method,
+                                           improved_method=improved_method)
+        if 'std_errors' in res:
+            std_errors[dataset_name] = res['std_errors']
+        if 'final_dataset_df' in res:
+            final_dataset_df[dataset_name] = res['final_dataset_df']
 
-    df = {}
-    # runs_per_set = 30
-    # seeds = range(0, runs_per_set)
-    n_groups = 2
-    for group_number in range(n_groups):
-        features += ['test_group_' + str(group_number) + '_coverage']
-        features += ['test_group_' + str(group_number) + '_interval_len']
-
-    def add_to_def(folder_name, dataset_name, display_name=''):
-
-        try:
-            results_path = helper.results_path + \
-                           'syn_data/minority_group_uncertainty=' + str(dataset_name) + '/' + folder_name + '/'
-
-            display_dataset_name = dataset_name
-
-            row_name = display_name + display_dataset_name
-            df[row_name] = {}
-            for seed in seeds:
-                try:
-                    path = results_path + f'seed={seed}.csv'
-                    res = pd.read_csv(path)
-                    cov = float(res['coverage'].item().replace("tensor(", "").replace(")", ""))
-                    res['test_wsc_diff'] = abs(float(res['test_wsc']) - cov)
-                    res = add_coverage_and_lengths_to_df(res)
-
-                except Exception as e:
-                    print(f"Didn't find results in path: {path}.")
-                    break
-                res = res.drop(['Unnamed: 0'], axis=1)
-
-                for feature in features:
-
-                    if feature not in df[row_name]:
-                        df[row_name][feature] = []
-                    df[row_name][feature] += [res.iloc[0][feature]]
-
-            if len(df[row_name]) == 0:
-                del df[row_name]
-
-        except Exception as e:
-            print(e)
-            del df[row_name]
-
-    method_name = loss_method
-
-    loss_name = f'batch_{method_name}'
-
-    if corr_multipliers is None:
-        corr_multipliers = [0.0, 0.01, 0.1, 0.5, 1., 2., 3.]
-
-    for corr_multiplier in corr_multipliers:
-        folder_name = get_folder_name_from_args(loss_name, corr_multiplier, 0.0)
-        add_to_def(folder_name, dataset_name,
-                   display_name=method_name + f'+corr{(corr_multiplier)}_λ=')
-
-    if hsic_multipliers is None:
-        hsic_multipliers = [0.0, 0.01, 0.1, 0.5, 1., 2.]
-
-    for hsic_multiplier in hsic_multipliers:
-        folder_name =  get_folder_name_from_args(loss_name, 0.0, hsic_multipliers)
-        add_to_def(folder_name, dataset_name,
-                   display_name=method_name + f'+hsic{(hsic_multiplier)}_λ=')
-
-    df = pd.DataFrame(df)
-
-    df_to_plot = pd.DataFrame(df).T.drop(['coverages', 'lengths'], axis=1, errors='ignore')
-
-    if display_tables_only:
-        backend_ = mpl.get_backend()
-        mpl.use("Agg")
-    plot_features(df_to_plot, x_name='', x_label='', limit_y=False, features=df_to_plot.columns)
-    if display_tables_only:
-        mpl.use(backend_)
-
-    summary_df = {}
-
-    for col in pd.DataFrame(df).columns:
-
-        summary_df[col] = summarize_df(df[col])
-
-        for i in range(2):
-            summary_df[col].update({
-                f'Group {i} coverage average': np.mean(df[col][f'test_group_{i}_coverage']),
-                f'Group {i} interval length average': np.mean(df[col][f'test_group_{i}_interval_len']),
-
-            })
-
-        for key in summary_df[col]:
-            if abs(summary_df[col][key]) < 1e-3 and abs(summary_df[col][key]) > 1e-20 and not math.isnan(
-                    summary_df[col][key]):
-                if summary_df[col][key] > 0:
-                    sign = ''
-                else:
-                    sign = '-'
-                summary_df[col][key] = sign + '1e' + str(int(np.log10(abs(summary_df[col][key]))))
-            else:
-                summary_df[col][key] = "{:.3f}".format(summary_df[col][key])
-    if len(pd.DataFrame(summary_df)) > 0:
-        display(pd.DataFrame(summary_df))
-
-    if 'coverages' not in pd.DataFrame(df).T.columns:
+    if len(std_errors) == 0:
         return
 
-    corr_per_dataset_per_loss = syn_corr_per_dataset_per_loss
-    try:
+    if is_calibrated:
+        base_method = base_method.replace("QR", "CQR")
+        improved_method = improved_method.replace("QR", "CQR")
 
-        measurements = ['test_hsic', 'test_wsc_diff', 'test_pearson_corr']
-        measurements_that_should_decrease = measurements
+    if loss_method == 'wqr':
+        base_method = base_method.replace("QR", "WQR")
+        improved_method = improved_method.replace("QR", "WQR")
 
-        # if there is an hsic column
-        compute_hsic = len([col for col in pd.DataFrame(df).columns if 'hsic' in col]) > 0
-        baseline_method = 'Vanilla QR'
-        improved_method = 'Orthogonal QR (corr)'
-        if compute_hsic:
-            improved_method = 'Orthogonal QR (HSIC)'
-            hsic_mult = corr_per_dataset_per_loss['hsic_qr'][dataset_name]
-            corr_mult = corr_per_dataset_per_loss['qr'][dataset_name]
+    metrics = list(std_errors[dataset_names[0]].keys())
+    metrics.remove("mean")
+    std_errors_df = {}
 
-            if len([col for col in pd.DataFrame(df).columns if str(corr_mult) in col and 'corr' in col]) == 0:
+    def print_method_res(dataset_name, metric):
+        mean = float_to_str(std_errors[dataset_name]['mean'][metric])
+        std_err = float_to_str(std_errors[dataset_name][metric])
+        return f"{mean} ({std_err})"
 
-                baseline_method_column_name = pd.DataFrame(df).columns[0]
-            else:
-                baseline_method = 'corr'
-                baseline_method_column_name = \
-                [col for col in pd.DataFrame(df).columns if str(corr_mult) in col and 'corr' in col][0]
-
-            baseline_method_column = pd.DataFrame(df)[baseline_method_column_name]
-
-            improved_method_column_name = \
-            [col for col in pd.DataFrame(df).columns if str(hsic_mult) in col and 'hsic' in col][0]
-            improved_method_column = pd.DataFrame(df)[improved_method_column_name]
-
+    def print_comparison_method_res(dataset_name, metric, method_number):
+        mean1 = std_errors[dataset_name]['mean'][metric][method_number]
+        mean2 = std_errors[dataset_name]['mean'][metric][1 - method_number]
+        std_err = std_errors[dataset_name][metric][method_number]
+        if mean1 < mean2 and print_latex:
+            return "\\textbf{" + float_to_str(mean1) + f" ({float_to_str(std_err)})" + "}"
         else:
-            corr_per_dataset = corr_per_dataset_per_loss[loss_method]
-            corr = corr_per_dataset[dataset_name]
-            baseline_method_column = pd.DataFrame(df)[pd.DataFrame(df).columns[0]]
+            return float_to_str(mean1) + f" ({float_to_str(std_errors[dataset_name][metric][method_number])})"
 
-            improved_method_column_name = [col for col in pd.DataFrame(df).columns if str(corr) in col][0]
-            improved_method_column = pd.DataFrame(df)[improved_method_column_name]
+    if len(methods_params) > 1 and base_method is not None and improved_method is not None:
+        for metric in metrics:
+            std_errors_df[metric] = {base_method: [print_comparison_method_res(dataset_name, metric, 0)
+                                                   for dataset_name in dataset_names],
 
-        final_dataset_df = {}
+                                     improved_method: [print_comparison_method_res(dataset_name, metric, 1)
+                                                       for dataset_name in dataset_names]
+                                     }
+    else:
+        for metric in metrics:
+            std_errors_df[metric] = [print_method_res(dataset_name, metric) for dataset_name in dataset_names]
 
-        for measurement in measurements_that_should_decrease:
-            increasement_ratio = np.mean(np.abs(improved_method_column[measurement])) / \
-                                 np.mean(np.abs(baseline_method_column[measurement]))
-            increasement_percentage = -(increasement_ratio - 1) * 100
+    if not keep_cov_and_len:
+        metrics.remove('coverage')
+        metrics.remove('interval_len')
+    if print_latex:
+        bolded_dataset_names = ["\\textbf{" + dataset_name + "}" for dataset_name in dataset_names]
+    else:
+        bolded_dataset_names = dataset_names
 
-            curr_key_name = measurement
-            final_dataset_df[curr_key_name] = '{:2.2f}'.format(np.round(increasement_percentage, 2))
-            if increasement_percentage > 0:
-                final_dataset_df[curr_key_name] = '+' + final_dataset_df[curr_key_name]
+    if len(methods_params) > 1 and base_method is not None and improved_method is not None:
+        std_errors_df = pd.concat(
+            dict(zip([metrics_rename_map[metric] for metric in metrics],
+                     [pd.DataFrame(std_errors_df[metric], index=bolded_dataset_names) for metric in metrics])), axis=1)
+    else:
+        std_errors_df = pd.DataFrame(std_errors_df)
+        std_errors_df = std_errors_df[metrics]
+        std_errors_df.columns = [metrics_rename_map[metric] for metric in metrics]
+        std_errors_df.index = bolded_dataset_names
 
-        parameters_order = ["Pearson's corr",
-                            'HSIC',
-                            'Delta WSC']
-        std_errors = calc_std_errors(baseline_method, improved_method,
-                                     baseline_method_column, improved_method_column)
+    if print_latex:
+        print(
+            std_errors_df.to_latex(index=True).replace("\\textbackslash ", "\\").replace("\{", "{").replace("\}", "}"))
 
-        row_name = 'λ=' + dataset_name
-        final_dataset_df = pd.concat({
+    print("Mean values and standard errors:")
+    display(std_errors_df)
+
+
+def get_results_dir(dataset_name, is_real, method_params):
+    method_dir = get_folder_name_from_args(method_params)
+
+    ds_type_dir = 'real_data' if is_real else 'syn_data'
+    if not is_real:
+        dataset_name = f'minority_group_uncertainty={dataset_name}'
+
+    return f"{helper.results_path}{ds_type_dir}/{dataset_name}/{method_dir}"
+
+
+def read_method_results(dataset_name, is_real, method_params, seeds):
+    results_dir = get_results_dir(dataset_name, is_real, method_params)
+    total_df = pd.DataFrame()
+    for seed in seeds:
+        path = f"{results_dir}/seed={seed}.csv"
+        try:
+            res = pd.read_csv(path)
+            cov = float(str(res['coverage'].item()).replace("tensor(", "").replace(")", ""))
+            res['test_wsc_diff'] = abs(float(res['test_wsc']) - cov)
+            res = add_coverage_and_lengths_to_df(res)
+            res = res.drop(['Unnamed: 0'], axis=1)
+            total_df = total_df.append(res)
+        except Exception as e:
+            print(f"Didn't find results in path: {path}.")
+            # raise e
+            break
+
+    return total_df
+
+
+def get_dataset_name_to_display(dataset_name, is_real, shorten=False):
+    if is_real:
+        if shorten:
+            n = ''
+            if 'meps' in dataset_name:
+                n = dataset_name[-2:]
+
+            if 'facebook' in dataset_name:
+                n = dataset_name[-1:]
+
+            if 'meps' in dataset_name:
+                display_dataset_name = dataset_name[0:3]
+            else:
+                display_dataset_name = dataset_name[0:4]
+
+            data_txt = f"{display_dataset_name}{n}"
+        else:
+            data_txt = dataset_name
+    else:
+        data_txt = f"λ={dataset_name}"
+    return data_txt
+
+
+def params_to_txt(method_param, dataset_name, is_real):
+    method = method_param['method']
+
+    if method == 'qr_forest':
+        param_txt = 'qr_forest'
+
+    else:
+        loss = method_param['loss']
+        loss_txt = f"{loss.replace('batch_', '')}"
+        corr_multiplier, hsic_multiplier = method_param['corr_multiplier'], method_param['hsic_multiplier']
+        corr_multiplier = float(corr_multiplier)
+        hsic_multiplier = float(hsic_multiplier)
+        if hsic_multiplier == 0:
+            param_txt = f'corr{corr_multiplier}'
+        elif corr_multiplier == 0:
+            param_txt = f'hsic{hsic_multiplier}'
+        else:
+            param_txt = f'corr{corr_multiplier}_hsic{hsic_multiplier}'
+        param_txt = f"{loss_txt}+{param_txt}"
+
+    data_txt = get_dataset_name_to_display(dataset_name, is_real, shorten=True)
+
+    return f"{param_txt}_{data_txt}"
+
+
+def read_results(dataset_name, is_real, methods_params, seeds):
+    df = pd.DataFrame()
+    for curr_params in methods_params:
+        try:
+            tmp_df = read_method_results(dataset_name, is_real, curr_params, seeds).applymap(lambda x: [x]).apply(
+                flatten_col, axis=0)
+            tmp_df.index = [params_to_txt(curr_params, dataset_name, is_real)]
+            df = df.append(tmp_df)
+        except Exception:
+            pass
+
+    return df
+
+
+def flatten_col(col):
+    return [[item for sublist in col for item in sublist]]
+
+
+def get_column_name_by_method(method, dataset_name, is_real, loss=None):
+    assert loss is not None  # not implemented yet
+    corr_per_dataset = (real_corr_per_dataset_per_loss if is_real else syn_corr_per_dataset_per_loss)[loss]
+    hsic_per_dataset = (real_hsic_per_dataset_per_loss if is_real else syn_hsic_per_dataset_per_loss)[loss]
+
+    corr = corr_per_dataset[dataset_name] if method == OQR_CORR else 0.
+    hsic = hsic_per_dataset[dataset_name] if method == OQR_HSIC else 0.
+    params = {'corr_multiplier': corr, 'hsic_multiplier': hsic, 'loss': loss, 'method': 'QR'}
+    method_column_name = params_to_txt(params, dataset_name, is_real)
+    return method_column_name
+
+
+def get_column_by_method(df, method, loss, dataset_name, is_real):
+    method_column_name = get_column_name_by_method(method, dataset_name, is_real, loss)
+    method_column = df[method_column_name]
+    return method_column
+
+
+def ratio_to_percentage_improvement(increment_ratio):
+    increment_percentage = -(increment_ratio - 1) * 100
+    increment_percentage_str = '{:2.2f}'.format(np.round(increment_percentage, 2))
+    if increment_percentage > 0:
+        increment_percentage_str = '+' + increment_percentage_str
+
+    return increment_percentage_str
+
+
+def get_improvement_df(baseline_method_column, improved_method_column, metrics):
+    improvement_df = {}
+    for metric in metrics:
+        increment_ratio = np.mean(np.abs(improved_method_column[metric])) / \
+                          np.mean(np.abs(baseline_method_column[metric]))
+        improvement_df[metric] = ratio_to_percentage_improvement(increment_ratio)
+
+    return improvement_df
+
+
+def get_final_df(dataset_name, is_real, baseline_method, improved_method, baseline_method_column,
+                 improved_method_column, minority_groups_info=None):
+    row_name = get_dataset_name_to_display(dataset_name, is_real)
+
+    if is_real:
+        coverage_dict = {
+            'Coverage': pd.DataFrame(
+                {baseline_method: ['{:2.2f}%'.format(np.mean(baseline_method_column.coverage) * 100)],
+                 improved_method: ['{:2.2f}%'.format(np.mean(improved_method_column.coverage) * 100)]},
+                index=[row_name])
+        }
+        length_dict = {
+            'Length': pd.DataFrame(
+                {baseline_method: ['{:2.2f}'.format(np.mean(baseline_method_column.interval_len))],
+                 improved_method: ['{:2.2f}'.format(np.mean(improved_method_column.interval_len))]},
+                index=[row_name])
+        }
+    else:
+        coverage_dict = {
             'Majority Coverage': pd.DataFrame({baseline_method: ['{:2.2f}%'.format(
                 np.mean(baseline_method_column['test_group_0_coverage']) * 100)],
                 improved_method: ['{:2.2f}%'.format(
@@ -1084,8 +842,9 @@ def display_syn_results_over_dataset(dataset_name, loss_method='qr', display_tab
                 np.mean(baseline_method_column['test_group_1_coverage']) * 100)],
                 improved_method: ['{:2.2f}%'.format(
                     np.mean(improved_method_column['test_group_1_coverage']) * 100)]},
-                index=[row_name]),
-
+                index=[row_name])
+        }
+        length_dict = {
             'Majority Lengths': pd.DataFrame({baseline_method: ['{:2.2f}'.format(
                 np.mean(baseline_method_column['test_group_0_interval_len']))],
                 improved_method: ['{:2.2f}'.format(
@@ -1095,65 +854,106 @@ def display_syn_results_over_dataset(dataset_name, loss_method='qr', display_tab
                 np.mean(baseline_method_column['test_group_1_interval_len']))],
                 improved_method: ['{:2.2f}'.format(
                     np.mean(improved_method_column['test_group_1_interval_len']))]},
-                index=[row_name]),
+                index=[row_name])
+        }
+    metrics = ['test_hsic', 'test_wsc_diff', 'test_pearson_corr']
+    improvement_df = get_improvement_df(baseline_method_column, improved_method_column, metrics)
+    parameters_order = ["Pearson's corr", 'HSIC', 'ΔWSC']
 
-            '% Improvement': pd.DataFrame(final_dataset_df, index=[row_name]).rename(
-                columns={'test_hsic': 'HSIC',
-                         'test_wsc_diff': 'Delta WSC',
-                         'test_pearson_corr': "Pearson's corr"})[parameters_order]
+    add_delta_ILS_and_node = 'vanilla' in baseline_method.lower() and is_real
+    if add_delta_ILS_and_node:
+        assert minority_groups_info is not None
+        parameters_order += ['ΔILS-Coverage', 'ΔNode-Coverage']
+        for key in ['Delta_node_coverage_ratio', 'Delta_ILS_coverage_ratio']:
+            improved_method_column_name = improved_method_column.name
+            improvement_df[key] = ratio_to_percentage_improvement(
+                minority_groups_info[improved_method_column_name][key])
 
-        }, axis=1)
+    improvement_dict = {'% Improvement': pd.DataFrame(improvement_df, index=[row_name]).rename(
+        columns=metrics_rename_map)[parameters_order]}
+    final_dataset_dict = {**coverage_dict, **length_dict, **improvement_dict}
+    final_dataset_df = pd.concat(final_dataset_dict, axis=1)
+    return final_dataset_df
 
-        save_dir = f"results/final_results/{dataset_name}"
-        create_folder_if_it_doesnt_exist(save_dir)
-        final_dataset_df.to_csv(
-            f'{save_dir}/{loss_method} {baseline_method} vs {improved_method} final_df.csv')
-        return std_errors, 'QR', 'OQR'
 
-    except Exception:
-        print("Don't have the full results to construct the final comparison table.")
-    # display(pd.DataFrame(final_dataset_df, index=[row_name]))
-    return {}
-def map_sign_to_color(sign):
-    if sign[0] not in ['+', '-']:
-        color = 'black'
-    elif sign[0] == '+':
-        color = 'green'
+def compute_relative_improvement(df, dataset_name, is_real, baseline_method, improved_method,
+                                 is_calibrated, loss_method=None, minority_groups_info=None):
+    baseline_method_column = get_column_by_method(df, baseline_method, loss_method, dataset_name, is_real)
+    improved_method_column = get_column_by_method(df, improved_method, loss_method, dataset_name, is_real)
+
+    if is_calibrated:
+        baseline_method = baseline_method.replace("QR", "CQR")
+        improved_method = improved_method.replace("QR", "CQR")
+
+    if loss_method == 'wqr':
+        baseline_method = baseline_method.replace("QR", "WQR")
+        improved_method = improved_method.replace("QR", "WQR")
+
+    final_dataset_df = get_final_df(dataset_name, is_real, baseline_method, improved_method, baseline_method_column,
+                                    improved_method_column, minority_groups_info)
+    std_errors = calc_std_errors_for_two_columns(baseline_method_column, improved_method_column,
+                                 improved_method_column_name=improved_method_column.name,
+                                 minorities_info=minority_groups_info)
+
+    if is_calibrated:
+        loss_method = 'cal_' + loss_method
+
+    save_dir = f"results/final_results/{dataset_name}"
+    create_folder_if_it_doesnt_exist(save_dir)
+    final_dataset_df.to_csv(
+        f'{save_dir}/{loss_method} {baseline_method} vs {improved_method} final_df.csv')
+
+    return final_dataset_df, std_errors
+
+
+def display_results_over_dataset(dataset_name, methods_params, display_tables_only=False, seeds=range(30),
+                                 desired_coverage=0.9, is_calibrated=False, is_real=False, base_method=VANILLA_QR,
+                                 improved_method=OQR_CORR):
+    if len({params['loss'] for params in methods_params if 'loss' in params}) == 1:
+        loss_method = methods_params[0]['loss']
     else:
-        color = 'red'
-    return 'color: %s' % color
+        loss_method = None
 
+    features = ['coverage', 'interval_len', 'coverages', 'lengths',
+                'test_hsic', 'test_wsc', 'test_wsc_diff',
+                'test_pearson_corr', 'test_pearson_pvalue'
+                ]
+    if not is_real:
+        n_groups = 2
+        for group_number in range(n_groups):
+            features += ['test_group_' + str(group_number) + '_coverage']
+            features += ['test_group_' + str(group_number) + '_interval_len']
 
-def synthetic_display_final_results(loss_method, baseline_method, improved_method):
-    dataset_names = ['3', '10']
+    df = read_results(dataset_name, is_real, methods_params, seeds)[features].T
+    if not display_tables_only:
+        df_to_plot = df.T.drop(['coverages', 'lengths'], axis=1, errors='ignore')
+        plot_features(df_to_plot, x_name='', x_label='', limit_y=False, features=df_to_plot.columns)
 
-    final_df = pd.DataFrame()
+    if is_real and len(methods_params) > 1:
+        minority_groups_info, summary_df = get_minority_groups_info_and_summary_df(df, base_method, loss_method,
+                                                                                   dataset_name, desired_coverage,
+                                                                                   is_calibrated, is_real)
+    else:
+        summary_df = summarize_df(df, is_real)
+        minority_groups_info = None
+    # display(summary_df)
 
-    for dataset_name in dataset_names:
+    if len(methods_params) > 1 and base_method is not None and improved_method is not None:
         try:
-            final_df = pd.concat([final_df, pd.read_csv(
-                f'results/final_results/{dataset_name}/{loss_method} {baseline_method} vs {improved_method} final_df.csv',
-                header=[0, 1], dtype=str)])
+            final_dataset_df, std_errors = compute_relative_improvement(df, dataset_name,
+                                                                        is_real,
+                                                                        base_method,
+                                                                        improved_method,
+                                                                        is_calibrated,
+                                                                        loss_method,
+                                                                        minority_groups_info)
+            res = {'final_dataset_df': final_dataset_df, 'std_errors': std_errors}
+            return res
         except Exception:
-            pass
-    try:
-        final_df = final_df.rename(columns={'Unnamed: 0_level_0': 'dataset name'}).set_index('dataset name')
-        indexes = ["$" + name[0].replace("λ", "\\lambda") + "$" for name in list(final_df.index)]
-        final_df = final_df.set_index(pd.Index(indexes))
-        styled_final_df = final_df.style.applymap(map_sign_to_color)
-        styled_final_df = styled_final_df.set_table_styles([
-            {'selector': 'th',
-             'props': [
-                 ('text-align', 'center'),
-                 ('border-width', '0px'),
-             ]
-             }]
-        )
-    except Exception:
-        print("No results to display.")
-        return None
-    display(styled_final_df)
-
-    styled_final_df.to_excel(f'results/final_results/syn {loss_method}, {baseline_method}_vs_{improved_method} styled_final_df.xlsx')
-
-    return styled_final_df
+            traceback.print_exc()
+            print("Don't have the full results to construct the final comparison table.")
+            return {}
+    else:
+        std_errors = calc_std_errors(df[df.columns[0]])
+        res = {'std_errors': std_errors}
+        return res

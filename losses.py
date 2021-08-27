@@ -63,7 +63,7 @@ def independence_penalty(y, pred_l, pred_u, pearsons_corr_multiplier=1, hsic_mul
     return penalty
 
 
-def batch_qr_loss(model, y, x, q_list, device, args):
+def batch_qr_loss(model, y, x, q_list, device, args, weights=None):
     num_pts = y.size(0)
 
     with torch.no_grad():
@@ -90,7 +90,11 @@ def batch_qr_loss(model, y, x, q_list, device, args):
     diff = pred_y - y_stacked
     mask = (diff.ge(0).float() - q_rep).detach()  # / q_rep
 
-    pinball_loss = ((mask * diff).mean())
+    pinball_losses = (mask * diff)
+    if weights is not None:
+        pinball_loss = pinball_losses.squeeze()@weights.repeat(num_q) / (num_q * weights.sum())
+    else:
+        pinball_loss = pinball_losses.mean()
 
     pearsons_corr_multiplier = args.corr_mult * 0.1
     hsic_multiplier = args.hsic_mult
@@ -104,7 +108,7 @@ def batch_qr_loss(model, y, x, q_list, device, args):
 
 
 
-def batch_interval_loss(model, y, x, q_list, device, args):
+def batch_interval_loss(model, y, x, q_list, device, args, weights=None):
     """
     implementation of interval score, for batch of quantiles
     """
@@ -134,11 +138,15 @@ def batch_interval_loss(model, y, x, q_list, device, args):
     below_l = (pred_l - y.view(-1)).gt(0)
     above_u = (y.view(-1) - pred_u).gt(0)
 
-    interval_score_loss = (pred_u - pred_l) + \
+    interval_score_losses = (pred_u - pred_l) + \
                           (1.0 / l_list).view(-1, 1).to(device) * (pred_l - y.view(-1)) * below_l + \
                           (1.0 / l_list).view(-1, 1).to(device) * (y.view(-1) - pred_u) * above_u
 
-    interval_score_loss = torch.mean(interval_score_loss)
+    if weights is not None:
+        interval_score_loss = interval_score_losses@weights
+    else:
+        interval_score_loss = interval_score_losses.mean()
+
 
     pearsons_corr_multiplier = args.corr_mult
     hsic_multiplier = args.hsic_mult * 10

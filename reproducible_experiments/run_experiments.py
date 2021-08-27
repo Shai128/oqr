@@ -1,25 +1,30 @@
 import subprocess
 from itertools import product
 import time
+import sys
+sys.path.append("./../")
+
 from reproducible_experiments.run_experiment import run_experiment
 
 def cartesian_product(inp):
     return (dict(zip(inp.keys(), values)) for values in product(*inp.values()))
 
+processes_to_run_in_parallel = 2
 
 all_params = {
-    'loss': ['batch_qr'],
+    'loss': ['batch_int'],
     'corr_mult': [0],
-    'hsic_mult': [0.1],
-    'data': ['kin8nm'],
-    'data_type': ['REAL'],
-    'seed': [(0, 30)],
+    'hsic_mult': [0],
+    'data':  ['3', '10'],
+    'data_type': ['SYN'],
+    'seed': [(0, 15), (15, 30)],
+    'method': ['QR']
 
 }
 
 """
 POSSIBLE_REAL_DATA_NAMES = ['kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21', 'facebook_1', 'facebook_2',
-'blog_data', 'scaled_bio', 'bio', 'bike']
+'blog_data', 'bio']
 """
 
 
@@ -31,7 +36,6 @@ has_seed = 'seed' in all_params
 params = list(cartesian_product(all_params))
 
 
-processes_to_run_in_parallel = 1
 
 
 processes_to_run_in_parallel = min(processes_to_run_in_parallel, len(params))
@@ -86,9 +90,9 @@ if __name__ == '__main__':
                 if jobs_finished_so_far % processes_to_run_in_parallel == 0:
                     print(f"finished so far: {jobs_finished_so_far}, {len(params)} jobs left")
         if has_seed:
-            time.sleep(3)
-        else:
             time.sleep(10)
+        else:
+            time.sleep(20)
 
     # joining all last proccesses
     for worker in workers:

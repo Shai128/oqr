@@ -8,7 +8,7 @@ This package contains a Python implementation of Orthogonal quantile regression 
 
 OQR is a method that improves the conditional validity of standard quantile regression methods.
 
-[1] Shai Feldman, Stephen Bates, Yaniv Romano, “Improving Conditional Coverage via Orthogonal Quantile Regression.” 2021.
+[1] Shai Feldman, Stephen Bates, Yaniv Romano, [“Improving Conditional Coverage via Orthogonal Quantile Regression.”](https://arxiv.org/abs/2106.00394) 2021.
 
 ## Getting Started
 

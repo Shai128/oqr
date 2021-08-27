@@ -3,12 +3,15 @@ Code copied from https://github.com/YoungseogChung/calibrated-quantile-uq
 """
 import os, sys
 from copy import deepcopy
+
+import matplotlib.pyplot as plt
 import tqdm
 import numpy as np
 import torch
 from scipy.stats import norm as norm_distr
 from scipy.stats import t as t_distr
 from scipy.interpolate import interp1d
+from torch import nn
 
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from NNKit.models.model import vanilla_nn
@@ -149,13 +152,13 @@ class QModelEns(uq_model):
                 device_list.append('cpu')
         print(device_list)
 
-    def loss(self, loss_fn, x, y, q_list, batch_q, take_step, args):
+    def loss(self, loss_fn, x, y, q_list, batch_q, take_step, args, weights=None):
         ens_loss = []
         for idx in range(self.num_ens):
             self.optimizers[idx].zero_grad()
             if self.keep_training[idx]:
                 if batch_q:
-                    loss = loss_fn(self.model[idx], y, x, q_list, self.device, args)
+                    loss = loss_fn(self.model[idx], y, x, q_list, self.device, args, weights=weights)
                 else:
                     loss = gather_loss_per_q(loss_fn, self.model[idx], y, x,
                                              q_list, self.device, args)
@@ -191,9 +194,9 @@ class QModelEns(uq_model):
 
         return np.asarray(ens_loss)
 
-    def update_va_loss(self, loss_fn, x, y, q_list, batch_q, curr_ep, num_wait, args):
+    def update_va_loss(self, loss_fn, x, y, q_list, batch_q, curr_ep, num_wait, args, weights=None):
         with torch.no_grad():
-            va_loss = self.loss(loss_fn, x, y, q_list, batch_q, take_step=False, args=args)
+            va_loss = self.loss(loss_fn, x, y, q_list, batch_q, take_step=False, args=args, weights=weights)
 
         # if torch.isnan(va_loss):
         #     print("va loss is nan!")
@@ -345,6 +348,85 @@ class QModelEns(uq_model):
 
 
 
+class MSEModel(nn.Module):
+
+    def __init__(self,
+                 in_dim,
+                 hidden_dim=64,
+                 dropout=0.1,
+                 device='cpu'):
+
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.base_model = nn.Sequential(
+            nn.Linear(self.in_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, 1),
+        ).to(device)
+
+        self.optimizer = torch.optim.Adam(self.parameters())
+        self.loss_func = torch.nn.MSELoss()
+
+    def forward(self, x):
+        return self.base_model(x).squeeze()
+
+    def epoch_loss(self, x_tr, y_tr, batch_size=64):
+        # self.train()
+        shuffle_idx = np.random.permutation(len(x_tr))
+        x_train = x_tr[shuffle_idx]
+        y_train = y_tr[shuffle_idx]
+        epoch_loss = []
+        for idx in range(0, x_train.shape[0], batch_size):
+            self.optimizer.zero_grad()
+            batch_x = x_train[idx: min(idx + batch_size, x_train.shape[0]), :]
+            batch_y = y_train[idx: min(idx + batch_size, y_train.shape[0])]
+            preds = self.forward(batch_x)
+            loss = ((preds - batch_y) ** 2).mean()
+            loss.backward()
+            self.optimizer.step()
+            epoch_loss += [loss.cpu().item()]
+        return np.mean(epoch_loss)
+
+    def fit(self, x_tr, y_tr, x_val, y_val, batch_size=64, n_epochs=1000, wait=100):
+        y_tr = y_tr.squeeze()
+        y_val = y_val.squeeze()
+        best_model = None
+        best_val_loss = np.inf
+        best_epoch = 0
+        val_losses = []
+        train_losses = []
+        for e in range(n_epochs):
+            loss = self.epoch_loss(x_tr, y_tr, batch_size=batch_size)
+            train_losses += [loss]
+            self.eval()
+            with torch.no_grad():
+                val_loss = ((self.forward(x_val) - y_val) ** 2).mean()
+            val_losses += [val_loss.cpu().item()]
+            if val_loss < best_val_loss:
+                best_model = deepcopy(self.base_model)
+                best_val_loss = val_loss
+                best_epoch = e
+            else:
+                if e - best_epoch > wait:
+                    break
+
+        # plt.semilogy(val_losses, label="validation loss")
+        # plt.semilogy(train_losses, label="train loss")
+        # plt.xlabel("epoch")
+        # plt.legend()
+        # plt.show()
+        self.base_model = best_model
+        self.eval()
+
+    def freeze(self):
+        for param in self.parameters():
+            param.requires_grad = False
 
 
 

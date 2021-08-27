@@ -17,7 +17,7 @@ corr_mults = syn_corr_per_dataset_per_loss
 
 
 all_params = []
-
+seed = (15, 30)
 # adding the during_training configurations
 all_params += [
     {
@@ -27,7 +27,8 @@ all_params += [
         'seed': 42,
         'corr_mult': 0,
         'hsic_mult': 0,
-        'save_training_results': True
+        'save_training_results': True,
+        'method': 'QR'
     },
     {
         'loss': 'batch_qr',
@@ -36,7 +37,9 @@ all_params += [
         'seed': 42,
         'corr_mult': corr_mults['qr']['3'],
         'hsic_mult': 0,
-        'save_training_results': True
+        'save_training_results': True,
+        'method': 'QR'
+
     }
 ]
 
@@ -48,18 +51,20 @@ for data in datasets:
                 'loss': loss,
                 'data': data,
                 'data_type': 'SYNTHETIC',
-                'seed': (0, 30),
+                'seed': seed,
                 'corr_mult': 0,
                 'hsic_mult': 0,
+                'method': 'QR'
 
             },
             {
                 'loss': loss,
                 'data': data,
                 'data_type': 'SYNTHETIC',
-                'seed': (0, 30),
+                'seed': seed,
                 'corr_mult': corr_mults[loss.replace("batch_", "")][data],
                 'hsic_mult': 0,
+                'method': 'QR'
 
             }]
 

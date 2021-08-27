@@ -47,10 +47,12 @@ def calibrate_test(cal_y, cal_y_upper, cal_y_lower, test_y_upper, test_y_lower):
     return q, test_y_upper + q, test_y_lower - q
 
 
-def calculate_calibrated_results(dataset_name, corr_mult, seed):
+def calculate_calibrated_results(dataset_name, corr_mult, seed, method):
     set_seeds(seed)
+    if method == 'qr':
+        method = f"loss=batch_qr_bs=1024_corr_mult={corr_mult}_hsic_mult=0.0"
     file = pd.read_csv(
-        f"{base_results_path}/{dataset_name}/loss=batch_qr_bs=1024_corr_mult={corr_mult}_hsic_mult=0.0/seed={seed}.csv")
+        f"{base_results_path}/{dataset_name}/{method}/seed={seed}.csv")
     cal_y, cal_y_upper, cal_y_lower, test_y, test_y_upper, test_y_lower, idx_test, idx_cal = \
         split_to_calibration_and_test(file)
     x_test = get_x_test(dataset_name, seed)[idx_test]
@@ -79,10 +81,19 @@ if __name__ == '__main__':
     for dataset_name in dataset_names:
         print(f"dataset: {dataset_name}")
         for corr_mult in [0., real_corr_per_dataset_per_loss['qr'][dataset_name]]:
-            for seed in tqdm(range(0, 30)):
-                return_values = calculate_calibrated_results(dataset_name, corr_mult, seed)
+            for seed in tqdm(range(0, 3)):
+                return_values = calculate_calibrated_results(dataset_name, corr_mult, seed, method='qr')
                 save_dir = f"{base_results_path}/{dataset_name}/cal_loss=batch_qr_bs=1024_corr_mult={corr_mult}_hsic_mult=0.0"
                 create_folder_if_it_doesnt_exist(save_dir)
                 pd.DataFrame(return_values).to_csv(f"{save_dir}/seed={seed}.csv", index=[seed])
+
+
+    # for dataset_name in ['meps_19']:
+    #     print(f"dataset: {dataset_name}")
+    #     for seed in tqdm(range(0, 30)):
+    #         return_values = calculate_calibrated_results(dataset_name, corr_mult=None, seed=seed, method='qr_forest')
+    #         save_dir = f"{base_results_path}/{dataset_name}/cal_qr_forest"
+    #         create_folder_if_it_doesnt_exist(save_dir)
+    #         pd.DataFrame(return_values).to_csv(f"{save_dir}/seed={seed}.csv", index=[seed])
 
 

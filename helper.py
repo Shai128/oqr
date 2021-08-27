@@ -2,15 +2,124 @@ import sys, os
 import torch
 import numpy as np
 from scipy import stats
+from skgarden import RandomForestQuantileRegressor
+from torch.utils.data import TensorDataset
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import random
 from datasets.datasets import scale_data, GetDataset
+import pandas as pd
+
+from utils.q_model_ens import MSEModel
 
 results_path = './results/'
 syn_data_path = './datasets/synthetic_data/'
 dataset_base_path = "./datasets/real_data/"
+REAL_DATA = 'real data'
+SYN_DATA = 'synthetic data'
 
+
+def get_wqr_weights(loss, x_tr, y_tr, x_va, y_va, args):
+    if 'wqr' in loss:
+        mse_model = MSEModel(in_dim=x_tr.shape[1], device=args.device)
+        mse_model.fit(x_tr, y_tr, x_va, y_va)
+        # w_tr = ((unscaled_x_tr[:, 0] == 0) + (unscaled_x_tr[:, 0] == 1) * 4).float()
+        w_tr = abs(mse_model(x_tr) - y_tr.squeeze()) ** (1)  # torch.ones(len(x_tr))
+        w_tr = w_tr.detach()
+        # w_te = (mse_model(x_te) - y_te) ** (-2)
+        # w_va = ((unscaled_x_va[:, 0] == 0) + (unscaled_x_va[:, 0] == 1) * 4).float()
+        w_va = abs(mse_model(x_va) - y_va.squeeze()) ** (1)  # torch.ones(len(x_va))
+        w_va = w_va.detach()
+        w_tr = w_tr.to(args.device)
+        w_va = w_va.to(args.device)
+
+        def get_tr_weights(idx):
+            return w_tr[idx]
+
+    else:
+        w_tr = w_va = None
+
+        def get_tr_weights(idx):
+            return None
+
+    return w_tr, w_va, get_tr_weights
+
+
+class IndexedDataset(TensorDataset):
+    def __init__(self, *tensors: torch.Tensor) -> None:
+        assert all(
+            tensors[0].size(0) == tensor.size(0) for tensor in tensors), "Size mismatch between tensors"
+        self.tensors = tensors
+
+    def __getitem__(self, index):
+        tensors = tuple(tensor[index] for tensor in self.tensors)
+        return tensors + (index,)
+
+    def __len__(self):
+        return self.tensors[0].size(0)
+
+
+def save_results(dataset_name, data_type, x_train, unscaled_x_train, x_test, unscaled_x_test, y_train, y_test,
+                 y_upper,
+                 y_lower,
+                 train_y_upper,
+                 train_y_lower,
+                 seed,
+                 args,
+                 minority_group_uncertainty=None,
+                 group_feature=None):
+    if data_type == SYN_DATA:
+        synthetic_data_params = {
+            'consider_groups': True,
+            'group_feature': group_feature
+        }
+        x_train = unscaled_x_train
+        x_test = unscaled_x_test
+    else:
+        synthetic_data_params = {
+            'consider_groups': False
+        }
+
+    return_values = calculate_results(x_train,
+                                      y_train,
+                                      x_test,
+                                      y_test,
+                                      y_upper,
+                                      y_lower,
+                                      train_y_upper,
+                                      train_y_lower,
+                                      **synthetic_data_params)
+
+    if data_type == SYN_DATA:
+        dataset_name = f"minority_group_uncertainty={minority_group_uncertainty}"
+
+    results_dir = get_method_results_dir(data_type, dataset_name, args)
+    create_folder_if_it_doesnt_exist(results_dir)
+    results_path = f"{results_dir}/seed={seed}.csv"
+
+    pd.DataFrame(return_values, index=[seed]).to_csv(results_path)
+
+
+def args_to_txt(args):
+    if args.method == 'wqr':
+        args_summary = 'wqr'
+    elif args.method == 'qr_forest':
+        args_summary = 'qr_forest'
+    else:
+        args_summary = str("loss=" + args.loss + "_bs=" + str(args.bs) + "_corr_mult=" +
+                           str(args.corr_mult) + '_hsic_mult=' + str(args.hsic_mult))
+    return args_summary
+
+
+def get_method_results_dir(dataset_type, data_name, args):
+    data_type_dir = 'syn_data' if dataset_type == SYN_DATA else 'real_data'
+    return f"{results_path}{data_type_dir}/{data_name}/{args_to_txt(args)}"
+
+
+def get_feature_as_function_of_mult_figure_dir(dataset_type, data_name, mult, args):
+    data_type_dir = 'syn_data' if dataset_type == SYN_DATA else 'real_data'
+    args_txt = f'loss={args.loss}_bs={args.bs}_mult={mult}'
+    return f"{results_path}{data_type_dir}/{data_name}/{args_txt}"
 
 
 def create_folder_if_it_doesnt_exist(path):
@@ -25,7 +134,6 @@ def set_seeds(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
 
 
 def pearsons_corr(x, y):
@@ -45,6 +153,7 @@ def pearsons_corr(x, y):
 
     return torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)))
 
+
 def pearsons_corr2d(x, y):
     """
 
@@ -63,7 +172,6 @@ def pearsons_corr2d(x, y):
     return torch.sum(vx * vy, dim=1) / (torch.sqrt(torch.sum(vx ** 2, dim=1)) * torch.sqrt(torch.sum(vy ** 2, dim=1)))
 
 
-
 def pairwise_distances(x):
     # x should be two dimensional
     instances_norm = torch.sum(x ** 2, -1).reshape((-1, 1))
@@ -73,7 +181,6 @@ def pairwise_distances(x):
 def GaussianKernelMatrix(x, sigma=1):
     pairwise_distances_ = pairwise_distances(x)
     return torch.exp(-pairwise_distances_ / sigma)
-
 
 
 def HSIC(x, y, s_x=1, s_y=1):
@@ -87,6 +194,7 @@ def HSIC(x, y, s_x=1, s_y=1):
 
 
 tanh = torch.nn.Tanh()
+
 
 def compute_coverages_and_avg_interval_len(y, y_lower, y_upper):
     """
@@ -106,20 +214,18 @@ def compute_coverages_and_avg_interval_len(y, y_lower, y_upper):
 
     interval_lengths = (y_upper - y_lower)
 
-    coverage_indicators = tanh(50*torch.min(y - y_lower, y_upper - y))
+    coverage_indicators = tanh(50 * torch.min(y - y_lower, y_upper - y))
 
     coverage_indicators = (coverage_indicators + 1) / 2
 
     return coverage_indicators, interval_lengths
 
 
-
-
 def chi_squared_test(y, y_lower, y_upper):
     # return np_histogram_chi_squared_test(y, y_lower, y_upper)
     n = len(y)
 
-    coverage = ((y >= y_lower) & (y <= y_upper)).float()  #.type(torch.float64)
+    coverage = ((y >= y_lower) & (y <= y_upper)).float()  # .type(torch.float64)
     interval_sizes = torch.Tensor(y_upper - y_lower)
     sorted_l, indices = interval_sizes.sort()
 
@@ -149,9 +255,8 @@ def chi_squared_test(y, y_lower, y_upper):
     return statistic, chi2_pvalue
 
 
-
-def wsc(X, y,  y_upper, y_lower, delta=0.1, M=1000, verbose=False):
-    def wsc_v(X, y,  y_upper, y_lower, delta, v):
+def wsc(X, y, y_upper, y_lower, delta=0.1, M=1000, verbose=False):
+    def wsc_v(X, y, y_upper, y_lower, delta, v):
         n = len(y)
         cover = ((y >= y_lower) & (y <= y_upper)).astype(np.float32)
         z = np.dot(X, v)
@@ -186,7 +291,7 @@ def wsc(X, y,  y_upper, y_lower, delta=0.1, M=1000, verbose=False):
     b_list = [[]] * M
     if verbose:
         for m in tqdm(range(M)):
-            wsc_list[m], a_list[m], b_list[m] = wsc_v(X, y,  y_upper, y_lower, delta, V[m])
+            wsc_list[m], a_list[m], b_list[m] = wsc_v(X, y, y_upper, y_lower, delta, V[m])
     else:
         for m in range(M):
             wsc_list[m], a_list[m], b_list[m] = wsc_v(X, y, y_upper, y_lower, delta, V[m])
@@ -199,25 +304,46 @@ def wsc(X, y,  y_upper, y_lower, delta=0.1, M=1000, verbose=False):
     return wsc_star, v_star, a_star, b_star
 
 
-
 def wsc_unbiased(X, y, y_upper, y_lower, delta=0.1, M=1000, test_size=0.75, random_state=2021, verbose=False):
     X, y, y_upper, y_lower = X.numpy(), y.numpy(), y_upper.numpy(), y_lower.numpy()
-    def wsc_vab(X, y, y_upper, y_lower, v, a, b):
 
+    def wsc_vab(X, y, y_upper, y_lower, v, a, b):
         cover = ((y >= y_lower) & (y <= y_upper)).astype(np.float32)
-        z = np.dot(X,v)
-        idx = np.where((z>=a)*(z<=b))
+        z = np.dot(X, v)
+        idx = np.where((z >= a) * (z <= b))
         coverage = np.mean(cover[idx])
         return coverage
 
     X_train, X_test, y_train, y_test, y_upper_train, y_upper_test, y_lower_train, y_lower_test = \
-                                                            train_test_split(X, y, y_upper,y_lower, test_size=test_size,
-                                                            random_state=random_state)
+        train_test_split(X, y, y_upper, y_lower, test_size=test_size,
+                         random_state=random_state)
     # Find adversarial parameters
-    wsc_star, v_star, a_star, b_star = wsc(X_train, y_train, y_upper_train, y_lower_train, delta=delta, M=M, verbose=verbose)
+    wsc_star, v_star, a_star, b_star = wsc(X_train, y_train, y_upper_train, y_lower_train, delta=delta, M=M,
+                                           verbose=verbose)
     # Estimate coverage
     coverage = wsc_vab(X_test, y_test, y_upper_test, y_lower_test, v_star, a_star, b_star)
     return coverage
+
+
+def run_tree_experiment(x_train, y_train, x_test, y_test, unscaled_x_train, unscaled_x_test, data_type,
+                        minority_group_uncertainty, group_feature, args, s, d):
+    rfqr = RandomForestQuantileRegressor(
+        random_state=s, min_samples_leaf=40, n_estimators=200, n_jobs=-1)
+    rfqr.fit(x_train.cpu(), y_train.cpu().flatten())
+    y_upper = torch.Tensor(rfqr.predict(x_test.cpu(), quantile=95)).to(args.device)
+    y_lower = torch.Tensor(rfqr.predict(x_test.cpu(), quantile=5)).to(args.device)
+    train_y_upper = torch.Tensor(rfqr.predict(x_train.cpu(), quantile=95)).to(args.device)
+    train_y_lower = torch.Tensor(rfqr.predict(x_train.cpu(), quantile=5)).to(args.device)
+    save_results(d, data_type, x_train, unscaled_x_train, x_test, unscaled_x_test, y_train.squeeze(),
+                 y_test.squeeze(),
+                 y_upper,
+                 y_lower,
+                 train_y_upper,
+                 train_y_lower,
+                 s,
+                 args,
+                 minority_group_uncertainty=minority_group_uncertainty,
+                 group_feature=group_feature)
 
 
 def get_x_test(dataset_name, seed):
@@ -236,7 +362,8 @@ def get_x_test(dataset_name, seed):
         data_out.y_va, data_out.y_te, data_out.y_al
     return x_te
 
-def calculate_test_results(x_test, y_test,  y_upper, y_lower):
+
+def calculate_test_results(x_test, y_test, y_upper, y_lower):
     x_test = x_test.clone().detach()
     y_test = y_test.clone().detach()
     y_upper = y_upper.clone().detach()
@@ -245,6 +372,9 @@ def calculate_test_results(x_test, y_test,  y_upper, y_lower):
     device = "cpu"
     coverage = ((y_test >= y_lower) & (y_test <= y_upper)).float()
     interval_sizes = (y_upper - y_lower).float()
+    return_values['coverage'] = coverage.mean().item()
+    return_values['interval_len'] = interval_sizes.mean().item()
+    return_values['interval_len_var'] = interval_sizes.var().item()
 
     chi2_statistic, chi2_pvalue = chi_squared_test(y_test, y_lower, y_upper)
     return_values['test_chi2_pvalue'] = chi2_pvalue
@@ -257,18 +387,16 @@ def calculate_test_results(x_test, y_test,  y_upper, y_lower):
 
     x, y = coverage, interval_sizes
     idx = np.random.permutation(len(x))[:5000]
-    hsic = HSIC(x[idx].reshape(len(idx), 1).to(device), y[idx].reshape(len(idx), 1).to(device))
+    hsic = HSIC(x[idx].reshape(len(idx), 1).to(device), y[idx].reshape(len(idx), 1).to(device)).item()
     return_values['test_hsic'] = hsic
 
     return_values['test_wsc'] = wsc_unbiased(x_test, y_test, y_upper, y_lower, M=500)
-
-    return_values['coverage'] = coverage.mean()
-    return_values['interval_len'] = interval_sizes.mean()
-    return_values['interval_len_var'] = interval_sizes.var()
+    return_values['test_wsc_diff'] = abs(float(return_values['test_wsc']) - return_values['coverage'])
 
     return return_values
 
-def calculate_results(x_train, y_train, x_test, y_test,  test_y_upper, test_y_lower, train_y_upper, train_y_lower,
+
+def calculate_results(x_train, y_train, x_test, y_test, test_y_upper, test_y_lower, train_y_upper, train_y_lower,
                       consider_groups=True, group_feature=0):
     return_values = {}
     device = "cpu"
@@ -297,20 +425,18 @@ def calculate_results(x_train, y_train, x_test, y_test,  test_y_upper, test_y_lo
     return_values['train_chi2_pvalue'] = chi2_pvalue
     return_values['train_chi2_statistic'] = chi2_statistic
 
-
     x, y = train_coverage, train_interval_sizes
     train_pearson_corr, train_pearson_pvalue = stats.pearsonr(x.cpu().detach().numpy(), y.cpu().detach().numpy())
     return_values['train_pearson_corr'] = train_pearson_corr
     return_values['train_pearson_pvalue'] = train_pearson_pvalue
 
-
     y_upper = train_y_upper
     y_lower = train_y_lower
     coverage = torch.tensor((y_train >= y_lower) & (y_train <= y_upper), dtype=torch.float64).float()
     interval_sizes = torch.tensor(y_upper - y_lower, dtype=torch.float64).float()
-    return_values['train_coverage'] = coverage.mean()
-    return_values['train_interval_len'] = interval_sizes.mean()
-    return_values['train_interval_len_var'] = interval_sizes.var()
+    return_values['train_coverage'] = coverage.mean().item()
+    return_values['train_interval_len'] = interval_sizes.mean().item()
+    return_values['train_interval_len_var'] = interval_sizes.var().item()
 
     if consider_groups:
         y_upper = test_y_upper
@@ -319,25 +445,24 @@ def calculate_results(x_train, y_train, x_test, y_test,  test_y_upper, test_y_lo
         interval_lengths = y_upper - y_lower
         n_groups = int(x_test[:, group_feature].max().item()) + 1
         for group_number in range(n_groups):
-            return_values['test_group_' + str(group_number) + '_coverage'] = (coverage[x_test[:,group_feature]
+            return_values['test_group_' + str(group_number) + '_coverage'] = (coverage[x_test[:, group_feature]
                                                                                        == group_number] == 1).sum().item() / len(
                 coverage[x_test[:, group_feature] == group_number])
             return_values['test_group_' + str(group_number) + '_interval_len'] = interval_lengths[
-                x_test[:, group_feature] == group_number].mean()
+                x_test[:, group_feature] == group_number].mean().item()
             return_values['test_group_' + str(group_number) + '_interval_len_var'] = interval_lengths[
-                x_test[:, group_feature] == group_number].var()
-
+                x_test[:, group_feature] == group_number].var().item()
 
         coverage = (y_train < train_y_upper) & (train_y_lower < y_train)
         interval_lengths = train_y_upper - train_y_lower
         n_groups = int(x_train[:, group_feature].max().item()) + 1
         for group_number in range(n_groups):
-            return_values['train_group_' + str(group_number) + '_coverage'] = (coverage[x_train[:,group_feature]
+            return_values['train_group_' + str(group_number) + '_coverage'] = (coverage[x_train[:, group_feature]
                                                                                         == group_number] == 1).sum().item() / len(
                 coverage[x_train[:, group_feature] == group_number])
             return_values['train_group_' + str(group_number) + '_interval_len'] = interval_lengths[
-                x_train[:, group_feature] == group_number].mean()
+                x_train[:, group_feature] == group_number].mean().item()
             return_values['train_group_' + str(group_number) + '_interval_len_var'] = interval_lengths[
-                x_train[:, group_feature] == group_number].var()
+                x_train[:, group_feature] == group_number].var().item()
 
     return return_values

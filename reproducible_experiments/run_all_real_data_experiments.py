@@ -5,16 +5,16 @@
 import time
 from reproducible_experiments.run_experiment import run_experiment
 from utils.penalty_multipliers import real_corr_per_dataset_per_loss
-processes_to_run_in_parallel = 2
+processes_to_run_in_parallel = 1
 
-loss_functions = ['batch_qr', 'batch_int']
+loss_functions = ['batch_qr', 'batch_int', 'batch_wqr']
 datasets = ['kin8nm', 'naval', 'meps_19', 'meps_20', 'meps_21', 'facebook_1', 'facebook_2',
             'blog_data', 'bio']
 
 
 corr_mults = real_corr_per_dataset_per_loss
 hsic_mults = corr_mults['hsic_qr']
-
+seed = (3, 10)
 # adding to a list all running configurations
 all_params = []
 for data in datasets:
@@ -24,29 +24,31 @@ for data in datasets:
                 'loss': loss,
                 'data': data,
                 'data_type': 'REAL',
-                'seed': (0, 30),
+                'seed': seed,
                 'corr_mult': 0,
                 'hsic_mult': 0,
-
+                'method': 'QR'
             },
             {
                 'loss': loss,
                 'data': data,
                 'data_type': 'REAL',
-                'seed': (0, 30),
+                'seed': seed,
                 'corr_mult': corr_mults[loss.replace("batch_", "")][data],
                 'hsic_mult': 0,
+                'method': 'QR'
 
             }]
     all_params += [{
                 'loss': 'batch_qr',
                 'data': data,
                 'data_type': 'REAL',
-                'seed': (0, 30),
+                'seed': seed,
                 'corr_mult': 0,
                 'hsic_mult': hsic_mults[data],
+                'method': 'QR'
 
-            }]
+    }]
 
 
 processes_to_run_in_parallel = min(processes_to_run_in_parallel, len(all_params))
