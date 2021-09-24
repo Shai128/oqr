@@ -2,7 +2,7 @@
 
 An important factor to guarantee a responsible use of data-driven recommendation systems is that we should be able to communicate their uncertainty to decision makers. This can be accomplished by constructing prediction intervals, which provide an intuitive measure of the limits of predictive performance.
 
-This package contains a Python implementation of Orthogonal quantile regression (OQR) [1] methodology for constructing distribusion-free prediction intervals. 
+This package contains a Python implementation of Orthogonal quantile regression (OQR) [1] methodology for constructing distribution-free prediction intervals. 
 
 # Orthogonal Quantile Regression [1]
 
