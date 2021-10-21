@@ -2,46 +2,68 @@
 # Script for reproducing the results of OQR paper
 ###############################################################################
 import sys
+
 sys.path.insert(1, '..')
 
 import time
 from reproducible_experiments.run_experiment import run_experiment
 from utils.penalty_multipliers import syn_corr_per_dataset_per_loss
 
-processes_to_run_in_parallel = 2
+processes_to_run_in_parallel = 1
 
 loss_functions = ['batch_qr', 'batch_int']
 datasets = ['3', '10']
 
 corr_mults = syn_corr_per_dataset_per_loss
 
-
 all_params = []
-seed = (15, 30)
+seed = (0, 30)
 # adding the during_training configurations
-all_params += [
-    {
-        'loss': 'batch_qr',
-        'data': '3',
-        'data_type': 'SYNTHETIC',
-        'seed': 42,
-        'corr_mult': 0,
-        'hsic_mult': 0,
-        'save_training_results': True,
-        'method': 'QR'
-    },
-    {
-        'loss': 'batch_qr',
-        'data': '3',
-        'data_type': 'SYNTHETIC',
-        'seed': 42,
-        'corr_mult': corr_mults['qr']['3'],
-        'hsic_mult': 0,
-        'save_training_results': True,
-        'method': 'QR'
 
-    }
-]
+for dataset in datasets:
+    all_params += [  # during training results of vanilla QR
+        {
+            'loss': 'batch_qr',
+            'data': dataset,
+            'data_type': 'SYNTHETIC',
+            'seed': 42,
+            'corr_mult': 0,
+            'hsic_mult': 0,
+            'save_training_results': True,
+            'method': 'QR'
+        },
+        {   # during training results of OQR
+            'loss': 'batch_qr',
+            'data': dataset,
+            'data_type': 'SYNTHETIC',
+            'seed': 42,
+            'corr_mult': corr_mults['qr'][dataset],
+            'hsic_mult': 0,
+            'save_training_results': True,
+            'method': 'QR'
+
+        },
+        {  # WQR results
+            'loss': 'batch_qr',
+            'data': dataset,
+            'data_type': 'SYNTHETIC',
+            'seed': (0, 30),
+            'corr_mult': 0,
+            'hsic_mult': 0,
+            'save_training_results': True,
+            'method': 'QR'
+        },
+        {   # OWQR results
+            'loss': 'batch_qr',
+            'data': dataset,
+            'data_type': 'SYNTHETIC',
+            'seed': (0, 30),
+            'corr_mult': corr_mults['wqr'][dataset],
+            'hsic_mult': 0,
+            'save_training_results': True,
+            'method': 'QR'
+        }
+    ]
 
 # adding to a list all running configurations
 for data in datasets:
@@ -67,7 +89,6 @@ for data in datasets:
                 'method': 'QR'
 
             }]
-
 
 processes_to_run_in_parallel = min(processes_to_run_in_parallel, len(all_params))
 

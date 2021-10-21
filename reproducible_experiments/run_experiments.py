@@ -12,12 +12,12 @@ def cartesian_product(inp):
 processes_to_run_in_parallel = 2
 
 all_params = {
-    'loss': ['batch_int'],
+    'loss': ['batch_wqr'],
     'corr_mult': [0],
     'hsic_mult': [0],
-    'data':  ['3', '10'],
     'data_type': ['SYN'],
-    'seed': [(0, 15), (15, 30)],
+    'seed': [(0,15), (15, 30)],
+    'data': ['3', '10'],
     'method': ['QR']
 
 }

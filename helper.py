@@ -2,6 +2,8 @@ import sys, os
 import torch
 import numpy as np
 from scipy import stats
+import six
+sys.modules['sklearn.externals.six'] = six
 from skgarden import RandomForestQuantileRegressor
 from torch.utils.data import TensorDataset
 from tqdm import tqdm

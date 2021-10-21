@@ -16,8 +16,6 @@ import helper
 from helper import SYN_DATA, REAL_DATA
 
 sys.modules['sklearn.externals.six'] = six
-from skgarden import RandomForestQuantileRegressor
-
 np.warnings.filterwarnings('ignore')
 
 os.environ["MKL_CBWR"] = 'AUTO'
@@ -179,7 +177,7 @@ if __name__ == '__main__':
         DATA_NAMES = REAL_DATA_NAMES
     else:
         assert data_type == SYN_DATA
-        if str(args.data) in [str(i) for i in range(0, 10)]:
+        if str(args.data) in [str(i) for i in range(0, 11)]:
             SYN_DATA_NAMES = [args.data]
         else:
             SYN_DATA_NAMES = ['3', '10']
